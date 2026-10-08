@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -96,10 +97,14 @@ class Machine:
         self.workdir = workdir
         self.spec = spec
         self.process: subprocess.Popen[bytes] | None = None
+        # Unix socket paths are limited to ~108 bytes; reach this VM's sockets through a
+        # short link so the run directory can live anywhere.
+        self.link = Path(tempfile.gettempdir()) / f"cbx-{uuid.uuid4().hex[:12]}"
+        self.link.symlink_to(workdir)
 
     @property
     def api_socket(self) -> Path:
-        return self.workdir / "api.sock"
+        return self.link / "api.sock"
 
     async def run(self, command: str, timeout: float | None = None) -> tuple[int, str]:
         """Run a bash command; returns (exit code, combined stdout/stderr).
@@ -114,6 +119,7 @@ class Machine:
         if self.process is not None and self.process.poll() is None:
             self.process.kill()
             await asyncio.to_thread(self.process.wait)
+        self.link.unlink(missing_ok=True)
         shutil.rmtree(self.workdir, ignore_errors=True)
 
     async def wait_ready(self) -> None:
@@ -134,7 +140,7 @@ class Machine:
 
     async def _guest(self, request: dict[str, object], timeout: float) -> dict[str, object]:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(str(self.workdir / "v.sock")), GUEST_CONNECT_TIMEOUT_S
+            asyncio.open_unix_connection(str(self.link / "v.sock")), GUEST_CONNECT_TIMEOUT_S
         )
         try:
             writer.write(f"CONNECT {GUEST_PORT}\n".encode())

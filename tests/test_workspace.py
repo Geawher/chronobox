@@ -106,3 +106,15 @@ async def test_main_switch_listeners_fire_around_rollback(backend: FirecrackerBa
     await workspace.checkpoint("c")
     await workspace.rollback("c")
     assert seen == ["before", "after"]
+
+
+async def test_machines_work_under_a_long_root_directory(tmp_path: Path) -> None:
+    deep = tmp_path / ("very-long-directory-name-" * 4) / ("another-long-segment-" * 3)
+    backend = FirecrackerBackend(deep)
+    try:
+        workspace = Workspace(backend, MachineSpec(mem_mib=256), profile=Profile.CHRONOBOX)
+        await workspace.start()
+        await workspace.fork("copy")
+        assert (await workspace.run("echo hi", where="copy")).startswith("hi")
+    finally:
+        await backend.cleanup()
