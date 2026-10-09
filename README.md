@@ -90,16 +90,6 @@ lazily; checkpoints are files on disk.
 | snapshot (checkpoint / fork point) | 0.3–0.7 s |
 | restore (rollback / fork) | 30–60 ms |
 
-## Evidence: what it does and does not do
-
-Measured on chronobox-ops (30 live-system tasks, 800+ Claude Code runs):
-
-- with normal Claude Code, Sonnet solved 40/42 tasks with chronobox vs 33/42 without
-  (p = 0.048; 16/18 vs 9/18 on the hardest tasks), at equal safety;
-- whole-machine rollback alone caused the most catastrophic runs (clients' writes
-  thrown away); chronobox gives undo without that damage;
-- Opus and easy tasks gain nothing; it adds 30–50 % wall time.
-
 ## Limits
 
 - Linux + KVM only; VMs have no network (everything a task needs runs inside).
