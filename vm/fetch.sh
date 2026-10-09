@@ -1,7 +1,9 @@
 #!/bin/sh
-# Download the Firecracker binary and a guest kernel into vm/build (no root needed).
+# Download the Firecracker binary and a guest kernel into $CHRONOBOX_VM_DIR (default vm/build; no root needed).
 set -e
-cd "$(dirname "$0")" && mkdir -p build && cd build
+cd "$(dirname "$0")"
+OUT=${CHRONOBOX_VM_DIR:-$PWD/build}
+mkdir -p "$OUT" && cd "$OUT"
 TAG=v1.17.0
 ARCH=x86_64
 if [ ! -x firecracker ]; then

@@ -29,7 +29,7 @@ KVM); a Linux VM with nested virtualization or a remote Linux box works.
 ## Quickstart
 
 ```bash
-git clone <this repo> && cd chronobox
+git clone https://github.com/Geawher/chronobox && cd chronobox
 uv sync
 vm/fetch.sh            # Firecracker + guest kernel into vm/build
 vm/build_rootfs.sh     # Debian root disk: Python, PostgreSQL, nginx, git, sqlite, uv...
@@ -40,6 +40,11 @@ claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp
 
 Each Claude Code session then gets a fresh machine (boot ≈ 1 s). Any MCP client
 works the same way.
+
+The VM image goes to `vm/build` of the checkout. To put it elsewhere (or when chronobox
+is installed as a package, e.g. by chronobox-ops), set `CHRONOBOX_VM_DIR` for both the
+build scripts and chronobox; an installed chronobox without it looks in
+`~/.local/share/chronobox/vm`.
 
 Options: `--profile alone|rollback|chronobox` (default `chronobox`), `--guard`,
 `--setup script.sh` (prepare the machine at boot: install, start services, load
@@ -110,3 +115,7 @@ src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints,
 vm/              image (Dockerfile, init, guest agent) · fetch.sh · build_rootfs.sh
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
 ```
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE).

@@ -47,12 +47,18 @@ class VMError(RuntimeError):
 def default_vm_dir() -> Path:
     """Where the Firecracker binary, kernel and root disk live.
 
-    ``CHRONOBOX_VM_DIR`` wins; otherwise ``vm/build`` of a source checkout.
+    ``CHRONOBOX_VM_DIR`` wins; then ``vm/build`` of a source checkout, if built; then
+    ``$XDG_DATA_HOME/chronobox/vm`` (``~/.local/share/chronobox/vm``), where an installed
+    package looks.
     """
     configured = os.environ.get("CHRONOBOX_VM_DIR")
     if configured:
         return Path(configured).expanduser()
-    return Path(__file__).resolve().parents[2] / "vm" / "build"
+    checkout = Path(__file__).resolve().parents[2] / "vm" / "build"
+    if checkout.is_dir():
+        return checkout
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return data_home / "chronobox" / "vm"
 
 
 @dataclass(frozen=True)

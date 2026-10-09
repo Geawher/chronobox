@@ -3,6 +3,8 @@ name = "chronobox"
 version = "0.2.0"
 description = "A Linux machine with exact undo and forks for coding agents (MCP server, Firecracker microVMs)."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = ["mcp>=2.3.0"]
 
