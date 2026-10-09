@@ -1,5 +1,7 @@
 """Workspace behaviour on real Firecracker VMs."""
 
+import asyncio
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -118,3 +120,17 @@ async def test_machines_work_under_a_long_root_directory(tmp_path: Path) -> None
         assert (await workspace.run("echo hi", where="copy")).startswith("hi")
     finally:
         await backend.cleanup()
+
+
+async def test_isolated_commands_run_alongside_and_stay_private(backend: FirecrackerBackend) -> None:
+    machine = await backend.start(MachineSpec(mem_mib=256))
+    await machine.run("cd /tmp && export SHARED=1")
+    busy = asyncio.create_task(machine.run("sleep 3"))
+    await asyncio.sleep(0.5)
+    mount = "mkdir -p /srv/p && mount -t tmpfs none /srv/p && echo secret > /srv/p/f && cat /srv/p/f && pwd"
+    started = time.monotonic()
+    code, output = await machine.run(mount, 30, isolated=True)
+    assert code == 0 and output.split() == ["secret", "/root"]
+    assert time.monotonic() - started < 2, "isolated command waited for the busy one"
+    await busy
+    assert (await machine.run("ls -A /srv/p; pwd; echo ${SHARED:-unset}"))[1].split() == ["/tmp", "1"]

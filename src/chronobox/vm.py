@@ -106,13 +106,19 @@ class Machine:
     def api_socket(self) -> Path:
         return self.link / "api.sock"
 
-    async def run(self, command: str, timeout: float | None = None) -> tuple[int, str]:
+    async def run(
+        self, command: str, timeout: float | None = None, *, isolated: bool = False
+    ) -> tuple[int, str]:
         """Run a bash command; returns (exit code, combined stdout/stderr).
 
-        The working directory and exported variables persist between commands.
+        The working directory and exported variables persist between commands, so
+        commands run one at a time. ``isolated`` commands are for observers (probes,
+        checkers): they run alongside the others in a private mount namespace, without
+        that shared state, and their script is not visible to other processes.
         """
         timeout = timeout or self.spec.command_timeout
-        reply = await self._guest({"op": "run", "command": command, "timeout": timeout}, timeout)
+        request = {"op": "run", "command": command, "timeout": timeout, "isolated": isolated}
+        reply = await self._guest(request, timeout)
         return int(reply.get("code", -1)), str(reply.get("output", ""))
 
     async def close(self) -> None:
