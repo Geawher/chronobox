@@ -52,6 +52,12 @@ async def test_fork_compare_promote_and_auto_checkpoint(backend: FirecrackerBack
     assert any(label.startswith("auto-") for label in workspace.checkpoints)
 
 
+async def test_large_output_comes_back_shortened(backend: FirecrackerBackend) -> None:
+    workspace = await start(backend, Profile.ALONE)
+    output = await workspace.run("head -c 200000 /dev/zero | tr '\\0' a; echo; echo end")
+    assert "characters omitted" in output and output.endswith("end\n[exit code 0]")
+
+
 async def test_alone_profile_has_no_checkpoints(backend: FirecrackerBackend) -> None:
     workspace = await start(backend, Profile.ALONE)
     with pytest.raises(WorkspaceError):

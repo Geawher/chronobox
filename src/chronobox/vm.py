@@ -33,6 +33,7 @@ VM_FILES = ("firecracker", "vmlinux", "rootfs.ext4")
 SETUP_TIMEOUT_S = 300.0
 GUEST_CONNECT_TIMEOUT_S = 5.0
 GUEST_REPLY_MARGIN_S = 30.0
+GUEST_REPLY_LIMIT = 2**26  # one JSON line holds the whole output; callers shorten it
 READY_TIMEOUT_S = 30.0
 API_SOCKET_WAIT_S = 2.0
 CONTENT_LENGTH = "content-length"
@@ -151,9 +152,8 @@ class Machine:
         return log.read_text(errors="replace")[-1500:] if log.exists() else ""
 
     async def _guest(self, request: dict[str, object], timeout: float) -> dict[str, object]:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(str(self.link / "v.sock")), GUEST_CONNECT_TIMEOUT_S
-        )
+        connect = asyncio.open_unix_connection(str(self.link / "v.sock"), limit=GUEST_REPLY_LIMIT)
+        reader, writer = await asyncio.wait_for(connect, GUEST_CONNECT_TIMEOUT_S)
         try:
             writer.write(f"CONNECT {GUEST_PORT}\n".encode())
             await writer.drain()
