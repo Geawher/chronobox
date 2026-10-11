@@ -39,15 +39,22 @@ INSTRUCTIONS = {
     Profile.ROLLBACK: (
         "You work on a Linux machine through `run`. You can save the whole machine (disk, "
         "memory, running processes) with `checkpoint` and restore it exactly with `rollback` "
-        "if something goes wrong — use them before risky changes."
+        "if something goes wrong — use them before risky changes. A rollback also undoes what "
+        "the machine's users did since the checkpoint (writes they were told had succeeded "
+        "are lost), so roll back soon after a mistake, or fix forward instead."
     ),
     Profile.CHRONOBOX: (
-        "You work on a Linux machine through `run`. Before anything risky you can `fork` the "
-        "whole machine (disk, memory, running processes, live traffic) into an independent "
-        "copy, try the change there (run/wait with where=<fork>), check that it really works "
-        "after some time, then apply the verified change to the main machine (or `promote` "
-        "a clean fork) and `discard` the rest. `checkpoint` / `rollback` restore the main "
-        "machine exactly; risky commands are checkpointed automatically. Discarding a fork "
+        "You work on a Linux machine through `run`. Whenever you are not sure what a change "
+        "will do (a config or tuning value, a migration, a cleanup, an upgrade, a restart), "
+        "first `fork` the whole machine (disk, memory, running processes, live traffic) into "
+        "an independent copy and make the change there (run/wait with where=<fork>). Let "
+        "time pass and check that it really works and that no data was lost or changed; "
+        "several forks can try different options side by side. Then make the verified "
+        "change on the main machine and `discard` the forks. `checkpoint` / `rollback` "
+        "restore the main machine exactly, and risky commands are checkpointed "
+        "automatically, but a rollback also undoes what the machine's users did since the "
+        "checkpoint (writes they were told had succeeded are lost): on a machine that takes "
+        "writes, prefer fixing forward with a change verified on a fork. Discarding a fork "
         "returns a report of what it did; lessons you record are shown again whenever you "
         "fork or roll back."
     ),
@@ -86,12 +93,15 @@ def build_server(profile: Profile, call: Call, *, guard: bool = False) -> MCPSer
     async def rollback(label: str, lesson: str = "") -> str:
         """Restore the main machine exactly to a checkpoint; everything after it is undone,
         including work that services did since then (e.g. writes clients were told had
-        succeeded). Record a lesson about what went wrong."""
+        succeeded, which are then lost). On a machine that keeps taking writes, the longer
+        since the checkpoint, the more is lost: prefer fixing forward unless losing that
+        work is acceptable. Record a lesson about what went wrong."""
         return await call("rollback", label, lesson)
 
     async def fork(name: str, from_checkpoint: str | None = None) -> str:
-        """Create an independent, exact copy of the main machine (or of a checkpoint) to try
-        something risky without touching the main machine."""
+        """Create an independent, exact copy of the main machine (or of a checkpoint), live
+        traffic included, to try something risky and watch its effect over time without
+        touching the main machine. Fork before any change whose effect you are not sure of."""
         return await call("fork", name, from_checkpoint)
 
     async def compare(command: str, forks: list[str] | None = None) -> str:

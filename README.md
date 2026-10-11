@@ -58,7 +58,7 @@ data), `--mem`, `--disk`.
 | `wait(seconds, where)` | all | let time pass while services and traffic keep running |
 | `checkpoint(label, note)` | rollback, chronobox | save the whole main machine |
 | `list_checkpoints()` | rollback, chronobox | checkpoints, lessons, open forks |
-| `rollback(label, lesson)` | rollback, chronobox | restore the main machine exactly; record why |
+| `rollback(label, lesson)` | rollback, chronobox | restore the main machine exactly (users' writes since the checkpoint are lost too); record why |
 | `fork(name, from_checkpoint)` | chronobox | independent copy of the live machine |
 | `compare(command, forks)` | chronobox | the same command on main and forks, side by side |
 | `changes(name)` | chronobox | commands, failures and files a fork changed |
@@ -66,6 +66,12 @@ data), `--mem`, `--disk`.
 
 With `--profile chronobox`, risky commands (deletes, kills, restarts, SQL changes,
 overwrites) are checkpointed automatically first.
+
+The tool descriptions steer the agent to the safe pattern on a machine that serves
+users: fork, try the change and let time pass on the fork, then apply the verified
+change to the main machine. A rollback is exact, so it also undoes the writes users
+made since the checkpoint; on a machine that takes writes, fixing forward is usually
+better.
 
 ## Long-lived machines
 
