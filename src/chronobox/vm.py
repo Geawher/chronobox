@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from chronobox.images import DEFAULT_IMAGE, TOOLS_DISK, image_disk
@@ -35,6 +35,7 @@ BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off quiet init=/sbin/chronobox-i
 VM_FILES = ("firecracker", "vmlinux", TOOLS_DISK)
 IMAGE_LINK = "image.ext4"
 DATA_DISK = "data.ext4"
+SPEC_FILE = "spec.json"
 # (drive id, file in the VM's directory, root device, read-only): the guest sees them as vda, vdb
 # and vdc in this order, which the tools drive's init relies on.
 DRIVES = (
@@ -46,6 +47,7 @@ SETUP_TIMEOUT_S = 300.0
 GUEST_CONNECT_TIMEOUT_S = 5.0
 GUEST_REPLY_MARGIN_S = 30.0
 GUEST_REPLY_LIMIT = 2**26  # one JSON line holds the whole output; callers shorten it
+TRANSFER_TIMEOUT_S = 300.0
 READY_TIMEOUT_S = 30.0
 API_SOCKET_WAIT_S = 2.0
 CONTENT_LENGTH = "content-length"
@@ -142,6 +144,41 @@ class Machine:
         reply = await self._guest(request, timeout)
         return int(reply.get("code", -1)), str(reply.get("output", ""))
 
+    async def put(self, path: str, archive: bytes, timeout: float = TRANSFER_TIMEOUT_S) -> None:
+        """Unpack a tar archive at ``path`` inside the machine's image (files belong to root).
+
+        Raises:
+            VMError: If the guest cannot unpack it.
+        """
+        request = {"op": "put", "path": path, "size": len(archive)}
+        reply, _ = await self._exchange(request, timeout, payload=archive)
+        _raise_for(reply, f"put {path}")
+
+    async def get(
+        self, path: str, *, exclude: tuple[str, ...] = (), timeout: float = TRANSFER_TIMEOUT_S
+    ) -> bytes:
+        """A tar archive of ``path`` in the machine's image: a folder's content as ``./...``,
+        a file under its own name.
+
+        Args:
+            path: Absolute path in the image.
+            exclude: Patterns left out: without "/", any path component (``node_modules``);
+                with "/", a relative path and what is under it (``data/cache``).
+            timeout: Seconds.
+
+        Raises:
+            VMError: If the path does not exist or cannot be read.
+        """
+        request = {"op": "get", "path": path, "exclude": list(exclude)}
+        reply, archive = await self._exchange(request, timeout)
+        _raise_for(reply, f"get {path}")
+        return archive
+
+    async def sync_clock(self) -> None:
+        """Set the guest's clock to the host's: a restored machine keeps its snapshot's time."""
+        reply, _ = await self._exchange({"op": "clock", "epoch": time.time()}, GUEST_CONNECT_TIMEOUT_S)
+        _raise_for(reply, "clock")
+
     async def close(self) -> None:
         if self.process is not None and self.process.poll() is None:
             self.process.kill()
@@ -166,6 +203,13 @@ class Machine:
         return log.read_text(errors="replace")[-1500:] if log.exists() else ""
 
     async def _guest(self, request: dict[str, object], timeout: float) -> dict[str, object]:
+        reply, _ = await self._exchange(request, timeout)
+        return reply
+
+    async def _exchange(
+        self, request: dict[str, object], timeout: float, *, payload: bytes = b""
+    ) -> tuple[dict[str, object], bytes]:
+        """One request line (plus raw bytes) to the guest agent; its reply line and any bytes after it."""
         connect = asyncio.open_unix_connection(str(self.link / "v.sock"), limit=GUEST_REPLY_LIMIT)
         reader, writer = await asyncio.wait_for(connect, GUEST_CONNECT_TIMEOUT_S)
         try:
@@ -174,10 +218,12 @@ class Machine:
             ack = await asyncio.wait_for(reader.readline(), GUEST_CONNECT_TIMEOUT_S)
             if not ack.startswith(b"OK"):
                 raise VMError(f"vsock connect failed: {ack!r}")
-            writer.write((json.dumps(request) + "\n").encode())
+            writer.write((json.dumps(request) + "\n").encode() + payload)
             await writer.drain()
-            line = await asyncio.wait_for(reader.readline(), timeout + GUEST_REPLY_MARGIN_S)
-            return json.loads(line)
+            reply = json.loads(await asyncio.wait_for(reader.readline(), timeout + GUEST_REPLY_MARGIN_S))
+            size = int(reply.get("size", 0)) if isinstance(reply, dict) else 0
+            data = await asyncio.wait_for(reader.readexactly(size), timeout) if size else b""
+            return reply, data
         finally:
             writer.close()
 
@@ -196,6 +242,10 @@ class FirecrackerBackend:
         self.stats = BackendStats()
         self._ids = itertools.count()
         self._specs: dict[str, MachineSpec] = {}
+        self._stores: dict[str, Path] = {}
+        # Saved machines this backend restores from but does not own (warm starts): never
+        # deleted, and old enough that their clock needs setting.
+        self._borrowed: set[str] = set()
         self._live: set[Machine] = set()
 
     async def start(self, spec: MachineSpec) -> Machine:
@@ -221,10 +271,40 @@ class FirecrackerBackend:
 
     async def snapshot(self, machine: Machine) -> Snapshot:
         """Save the whole machine; it is paused for the duration (typically < 1 s)."""
-        started = time.monotonic()
         key = str(next(self._ids))
         store = self.root / "snapshots" / key
         store.mkdir()
+        await self._snapshot_into(machine, store)
+        self._specs[key] = machine.spec
+        self._stores[key] = store
+        return Snapshot(key)
+
+    async def restore(self, snapshot: Snapshot) -> Machine:
+        """Start a new, independent machine from a snapshot."""
+        machine = await self._restore_from(self._stores[snapshot.key], self._specs[snapshot.key])
+        if snapshot.key in self._borrowed:
+            await machine.sync_clock()
+        return machine
+
+    async def save(self, machine: Machine, directory: Path) -> None:
+        """Save the whole machine into ``directory``, outside this backend's root: it outlives
+        ``cleanup``, and any backend on the same VM files can ``borrow`` it (warm starts)."""
+        directory.mkdir(parents=True, exist_ok=True)
+        await self._snapshot_into(machine, directory)
+        (directory / SPEC_FILE).write_text(json.dumps(asdict(machine.spec)))
+
+    def borrow(self, directory: Path) -> Snapshot:
+        """Use a ``save``d machine as a snapshot of this backend, without owning it: ``release``
+        leaves it in place, and machines restored from it get the host's clock."""
+        fields = json.loads((directory / SPEC_FILE).read_text())
+        key = str(next(self._ids))
+        self._specs[key] = MachineSpec(**{**fields, "setup": tuple(fields["setup"])})
+        self._stores[key] = directory
+        self._borrowed.add(key)
+        return Snapshot(key)
+
+    async def _snapshot_into(self, machine: Machine, store: Path) -> None:
+        started = time.monotonic()
         await _api(machine.api_socket, "PATCH", "/vm", {"state": "Paused"})
         try:
             await _api(machine.api_socket, "PUT", "/snapshot/create", {
@@ -235,16 +315,12 @@ class FirecrackerBackend:
             await asyncio.to_thread(_sparse_copy, machine.workdir / DATA_DISK, store / DATA_DISK)
         finally:
             await _api(machine.api_socket, "PATCH", "/vm", {"state": "Resumed"})
-        self._specs[key] = machine.spec
         self.stats.snapshots += 1
         self.stats.snapshot_seconds += time.monotonic() - started
-        return Snapshot(key)
 
-    async def restore(self, snapshot: Snapshot) -> Machine:
-        """Start a new, independent machine from a snapshot."""
+    async def _restore_from(self, store: Path, spec: MachineSpec) -> Machine:
         started = time.monotonic()
-        store = self.root / "snapshots" / snapshot.key
-        machine = self._new_machine(self._specs[snapshot.key])
+        machine = self._new_machine(spec)
         await asyncio.to_thread(_sparse_copy, store / DATA_DISK, machine.workdir / DATA_DISK)
         await self._launch(machine)
         await _api(machine.api_socket, "PUT", "/snapshot/load", {
@@ -259,7 +335,11 @@ class FirecrackerBackend:
 
     async def release(self, snapshot: Snapshot) -> None:
         self._specs.pop(snapshot.key, None)
-        shutil.rmtree(self.root / "snapshots" / snapshot.key, ignore_errors=True)
+        store = self._stores.pop(snapshot.key, None)
+        if snapshot.key in self._borrowed:
+            self._borrowed.discard(snapshot.key)
+        elif store is not None:
+            shutil.rmtree(store, ignore_errors=True)
 
     async def stop(self, machine: Machine) -> None:
         await self._close(machine)
@@ -351,6 +431,11 @@ async def _api(socket_path: Path, method: str, path: str, body: dict[str, object
     if not code.startswith("2"):
         raise VMError(f"{method} {path}: {status.strip()} {text}")
     return text
+
+
+def _raise_for(reply: dict[str, object], action: str) -> None:
+    if "error" in reply:
+        raise VMError(f"{action}: {reply['error']}")
 
 
 def _die_with_parent() -> None:

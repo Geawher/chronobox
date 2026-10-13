@@ -89,11 +89,52 @@ claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp --image myapp
 
 The image needs nothing from chronobox (no Python, no init): commands run inside it
 with its own shell (bash if it has one, else `sh`), its `ENV` and its `WORKDIR`, as
-root. Nothing is started automatically; start the image's services from `--setup` or
-let the agent do it (e.g. `docker-entrypoint.sh postgres &` in the postgres image).
+root. Nothing is started automatically; start the image's services from `--setup`, from
+a project's `chronobox.toml` (below), or let the agent do it (e.g.
+`docker-entrypoint.sh postgres &` in the postgres image).
 
-Options: `--image NAME` (default `default`), `--profile alone|rollback|chronobox`
-(default `chronobox`), `--guard`,
+### Your project
+
+A `chronobox.toml` next to your code says how to bring it up; the agent then works on an
+exact, running copy of it ([example](examples/notes/chronobox.toml): a web app and its
+PostgreSQL database):
+
+```toml
+image = { dockerfile = "Dockerfile.dev" }   # or "name" of a built image, or { reference = "postgres:16" }
+prepare = ["make build"]                    # after the code is copied, before services
+setup = ["bin/migrate", "bin/seed"]         # once every service is ready
+
+[machine]
+mem_mib = 2048
+disk_mib = 8192
+
+[project]
+exclude = ["node_modules", "*.log"]         # .git and .chronobox are never copied
+
+[[service]]
+name = "db"
+start = "docker-entrypoint.sh postgres"     # runs in the foreground; restarted if it exits
+ready = "pg_isready -h 127.0.0.1"
+env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
+```
+
+```bash
+uv run chronobox build --project path/to/app       # the image it declares, once
+claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp --project path/to/app
+```
+
+- The project is copied to `/src` (`[project] target`), where commands start.
+- Services run under a small restart loop, logs in `/var/log/chronobox/<name>.log`.
+- **Warm start**: the first session prepares the machine and saves it
+  (`~/.cache/chronobox/warm`); later sessions restore it in about a second, as long as the
+  config, the project's files and the image are unchanged (`--no-warm` to boot fresh). The
+  saved machine is also the session's `start` checkpoint.
+- Two more tools: `diff(where)` (what changed in the project on main or a fork, as a patch
+  for your local copy) and `export(path, where)` (copy files out to `.chronobox/exports/`).
+- Machines have no network: install everything in the image.
+
+Options: `--project DIR`, `--no-warm`, `--image NAME` (default `default`),
+`--profile alone|rollback|chronobox` (default `chronobox`), `--guard`,
 `--setup script.sh` (prepare the machine at boot: install, start services, load
 data), `--mem`, `--disk`.
 
@@ -110,6 +151,7 @@ data), `--mem`, `--disk`.
 | `compare(command, forks)` | chronobox | the same command on main and forks, side by side |
 | `changes(name)` | chronobox | commands, failures and files a fork changed |
 | `promote(name)` / `discard(name, lesson)` | chronobox | keep a fork as main / drop it, with a report |
+| `diff(where)` / `export(path, where)` | chronobox, with `--project` | the project's changes as a patch / copy files out |
 
 With `--profile chronobox`, risky commands (deletes, kills, restarts, SQL changes,
 overwrites) are checkpointed automatically first.
@@ -157,9 +199,11 @@ lazily; checkpoints are files on disk.
 ```
 src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints, forks,
                  reports, lessons, guard) · commands.py · service.py · server.py (MCP)
-                 images.py · cli.py (`chronobox build` / `images`)
+                 images.py · cli.py (`chronobox build` / `images`) · config.py (chronobox.toml)
+                 project.py (bring a project up, warm start, diff, export)
 vm/              tools/ (tools drive: init, guest agent) · images/default/ · fetch.sh · build_rootfs.sh
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
+examples/notes/  a web app + PostgreSQL project with its chronobox.toml
 ```
 
 ## License

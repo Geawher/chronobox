@@ -7,7 +7,8 @@ service with one JSON line per request and get one JSON line back:
 - ``{"op": "status"}`` → ``{"ready": true, "error": null}`` once the machine booted
 - ``{"op": "shutdown"}`` → stops serving; the owner then closes the workspace
 
-Harnesses can register extra operations (e.g. a benchmark's hidden checker).
+Harnesses can register extra operations (e.g. a benchmark's hidden checker), and extra
+tool methods (e.g. a project's ``diff``) callable like the workspace's own.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ TOOL_METHODS = frozenset({
 })  # fmt: skip
 
 Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+Method = Callable[..., Awaitable[str]]
 
 
 class Op(StrEnum):
@@ -46,6 +48,7 @@ class WorkspaceService:
         self.stopped = asyncio.Event()
         self.error: str | None = None
         self.extra_ops: dict[str, Handler] = {}
+        self.extra_methods: dict[str, Method] = {}
 
     async def boot(self, then: Callable[[], Awaitable[None]] | None = None) -> None:
         """Start the machine; failures are kept and reported to every caller."""
@@ -60,12 +63,14 @@ class WorkspaceService:
 
     async def call(self, method: str, *args: Any) -> str:
         """Run one workspace tool; agent mistakes come back as ``error: ...`` text."""
-        if method not in TOOL_METHODS:
+        if method not in TOOL_METHODS and method not in self.extra_methods:
             return f"error: unknown tool {method!r}"
         await self.ready.wait()
         if self.error:
             return f"error: machine failed to start: {self.error}"
         try:
+            if method in self.extra_methods:
+                return await self.extra_methods[method](*args)
             result = getattr(self.workspace, method)(*args)
             return await result if asyncio.iscoroutine(result) else result
         except WorkspaceError as error:

@@ -1,0 +1,83 @@
+"""Reading chronobox.toml (no VM)."""
+
+from pathlib import Path
+
+import pytest
+
+from chronobox.config import DEFAULT_EXCLUDES, ConfigError, load_config
+
+EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "notes"
+
+
+def write(folder: Path, text: str) -> Path:
+    (folder / "chronobox.toml").write_text(text)
+    return folder
+
+
+def test_the_example_project_reads_as_written() -> None:
+    config = load_config(EXAMPLE)
+    assert config.path == EXAMPLE
+    assert (config.image.name, config.target) == ("default", "/src")
+    assert [service.name for service in config.services] == ["db", "app"]
+    assert config.services[1].ready.startswith("curl")
+    assert config.setup == ("python3 migrate.py",)
+    assert config.exclude == (*DEFAULT_EXCLUDES, "__pycache__")
+
+
+def test_defaults_for_a_minimal_file(tmp_path: Path) -> None:
+    config = load_config(write(tmp_path, ""))
+    assert (config.image.name, config.path, config.target) == ("default", tmp_path, "/src")
+    assert (config.services, config.prepare, config.setup) == ((), (), ())
+
+
+def test_image_from_a_dockerfile_resolves_paths_from_the_file(tmp_path: Path) -> None:
+    (tmp_path / "docker").mkdir()
+    config = load_config(write(tmp_path, 'image = { dockerfile = "docker/Dockerfile.dev" }\n'))
+    assert config.image.dockerfile == tmp_path / "docker" / "Dockerfile.dev"
+    assert config.image.context == tmp_path / "docker"
+    assert config.image.name == "docker"
+
+
+def test_image_from_a_reference_gets_a_file_safe_name(tmp_path: Path) -> None:
+    config = load_config(write(tmp_path, 'image = { reference = "postgres:16" }\n'))
+    assert (config.image.name, config.image.reference) == ("postgres-16", "postgres:16")
+
+
+def test_services_keep_their_options(tmp_path: Path) -> None:
+    text = """
+[[service]]
+name = "db"
+start = "docker-entrypoint.sh postgres"
+ready = "pg_isready"
+env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
+restart = false
+ready_timeout = 30
+"""
+    (service,) = load_config(write(tmp_path, text)).services
+    assert service.env == {"POSTGRES_HOST_AUTH_METHOD": "trust"}
+    assert (service.restart, service.ready_timeout, service.workdir) == (False, 30.0, "")
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("imag = 'x'\n", "unknown keys in the top level: imag"),
+        ("[machine]\nmemory = 1\n", "unknown keys in machine: memory"),
+        ("image = { reference = 'a', dockerfile = 'b' }\n", "exactly one"),
+        ("image = { name = 'a' }\n", "exactly one"),
+        ("[[service]]\nname = 'db'\n", "name and a start command"),
+        ("[[service]]\nname = 'a'\nstart = 'x'\n[[service]]\nname = 'a'\nstart = 'y'\n", "unique"),
+        ("[[service]]\nname = 'a'\nstart = 'x'\nenv = { PORT = 5432 }\n", "strings"),
+        ("[project]\ntarget = 'src'\n", "absolute"),
+        ("setup = 'make'\n", "setup must be a list of str"),
+        ("image = [", "chronobox.toml"),
+    ],
+)
+def test_mistakes_are_reported_clearly(tmp_path: Path, text: str, message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        load_config(write(tmp_path, text))
+
+
+def test_a_missing_file_says_where_it_looked(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="no chronobox.toml"):
+        load_config(tmp_path)

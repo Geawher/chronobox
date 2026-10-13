@@ -54,6 +54,23 @@ GUARD_REFUSAL = (
 Listener = Callable[[], Awaitable[None]]
 
 
+@dataclass(frozen=True)
+class Booted:
+    """A main machine started by a custom boot.
+
+    Attributes:
+        machine: The running machine.
+        snapshot: The machine as it was booted, if already saved (e.g. a warm start's): it
+            becomes the start checkpoint instead of a new snapshot.
+    """
+
+    machine: Machine
+    snapshot: Snapshot | None = None
+
+
+Boot = Callable[[], Awaitable[Booted]]
+
+
 class Profile(StrEnum):
     ALONE = "alone"
     ROLLBACK = "rollback"
@@ -98,6 +115,8 @@ class Workspace:
         profile: What the agent may do (see module docstring).
         guard: Refuse unrehearsed destructive commands on main (chronobox profile).
         max_output: Command output beyond this many characters is shortened in the middle.
+        boot: Starts the main machine instead of ``backend.start(spec)`` (e.g. a project's
+            warm start); its machine and snapshot must belong to ``backend``.
     """
 
     def __init__(
@@ -108,6 +127,7 @@ class Workspace:
         profile: Profile = Profile.CHRONOBOX,
         guard: bool = False,
         max_output: int = 6000,
+        boot: Boot | None = None,
     ) -> None:
         if guard and profile is not Profile.CHRONOBOX:
             raise ValueError("guard needs forks (profile chronobox)")
@@ -117,6 +137,7 @@ class Workspace:
         self.guard = guard
         self.auto_checkpoint = profile is Profile.CHRONOBOX
         self.max_output = max_output
+        self._boot = boot
         self.main: Machine | None = None
         self.forks: dict[str, Fork] = {}
         self.checkpoints: dict[str, Checkpoint] = {}
@@ -129,9 +150,14 @@ class Workspace:
 
     # ---- lifecycle
     async def start(self) -> None:
-        self.main = await self.backend.start(self.spec)
-        if self.profile is not Profile.ALONE:
+        booted = await self._boot() if self._boot else Booted(await self.backend.start(self.spec))
+        self.main = booted.machine
+        if self.profile is Profile.ALONE:
+            return
+        if booted.snapshot is None:
             await self._save_checkpoint(START, "initial state")
+        else:
+            self.checkpoints[START] = Checkpoint(START, booted.snapshot, time.time(), "initial state")
 
     async def close(self) -> None:
         machines = [self.main, *(fork.machine for fork in self.forks.values())]
@@ -354,6 +380,14 @@ class Workspace:
             for lesson in elsewhere[-SHOWN_OTHER_LESSONS:]
         ]
         return "\n".join(lines)
+
+    def machine(self, where: str = MAIN) -> Machine:
+        """The main machine or a fork's.
+
+        Raises:
+            WorkspaceError: If it does not exist.
+        """
+        return self._machine(where)
 
     def _machine(self, where: str) -> Machine:
         if where != MAIN:

@@ -1,0 +1,232 @@
+"""``chronobox.toml``: how to bring a project up in a chronobox machine.
+
+A project commits one file next to its code::
+
+    image = "myapp"                     # a built image (`chronobox images`), or a table:
+    # image = { dockerfile = "Dockerfile.dev", context = ".", name = "myapp" }
+    # image = { reference = "postgres:16" }
+    prepare = ["make build"]            # after the project is copied, before services start
+    setup = ["bin/migrate", "bin/seed"] # once the services are ready
+
+    [machine]
+    mem_mib = 2048
+    disk_mib = 8192
+
+    [project]
+    path = "."                          # copied into the machine at `target`
+    target = "/src"
+    exclude = [".git", "node_modules"]
+
+    [[service]]
+    name = "db"
+    start = "docker-entrypoint.sh postgres"
+    ready = "pg_isready -h 127.0.0.1"
+    env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
+
+Relative paths are relative to the file's folder. Machines have no network: anything to
+install belongs in the image.
+"""
+
+from __future__ import annotations
+
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from chronobox.images import DEFAULT_IMAGE, image_name
+
+CONFIG_FILE = "chronobox.toml"
+DEFAULT_TARGET = "/src"
+DEFAULT_EXCLUDES = (".git", ".chronobox")
+DEFAULT_READY_TIMEOUT_S = 120.0
+TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service"})
+MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
+PROJECT_KEYS = frozenset({"path", "target", "exclude"})
+IMAGE_KEYS = frozenset({"name", "reference", "dockerfile", "context"})
+SERVICE_KEYS = frozenset({"name", "start", "ready", "env", "workdir", "restart", "ready_timeout"})
+
+
+class ConfigError(ValueError):
+    """``chronobox.toml`` is missing, unreadable or inconsistent."""
+
+
+@dataclass(frozen=True)
+class ImageSource:
+    """Which image the machine runs, and how ``chronobox build --project`` makes it.
+
+    Attributes:
+        name: The built image's name.
+        reference: A Docker image to use as is, if built from one.
+        dockerfile: A Dockerfile to build, if built from one.
+        context: The Dockerfile's build context.
+    """
+
+    name: str
+    reference: str | None = None
+    dockerfile: Path | None = None
+    context: Path | None = None
+
+
+@dataclass(frozen=True)
+class Service:
+    """A long-running process of the project, started in the machine before ``setup``.
+
+    Attributes:
+        name: Used for its log, ``/var/log/chronobox/<name>.log``.
+        start: Shell command that runs the service in the foreground.
+        ready: Shell command that succeeds once the service answers; empty: started is ready.
+        env: Extra environment variables for ``start``.
+        workdir: Where ``start`` runs; defaults to the project's target.
+        restart: Start it again whenever it exits (like Docker's ``unless-stopped``).
+        ready_timeout: Seconds to wait for ``ready`` before the boot fails.
+    """
+
+    name: str
+    start: str
+    ready: str = ""
+    env: dict[str, str] = field(default_factory=dict)
+    workdir: str = ""
+    restart: bool = True
+    ready_timeout: float = DEFAULT_READY_TIMEOUT_S
+
+
+@dataclass(frozen=True)
+class ProjectConfig:
+    """A parsed ``chronobox.toml``.
+
+    Attributes:
+        file: The config file itself.
+        image: The machine's image.
+        path: The project folder copied into the machine.
+        target: Where it is copied in the machine.
+        exclude: Names or relative paths not copied (``.git`` and ``.chronobox`` always).
+        prepare: Commands run after the copy, before the services.
+        services: Started in order; each must be ready before the next starts.
+        setup: Commands run once every service is ready.
+        mem_mib: Guest memory.
+        disk_mib: Writable disk.
+        vcpus: Virtual CPUs.
+        command_timeout: Default timeout of one command, in seconds.
+    """
+
+    file: Path
+    image: ImageSource
+    path: Path
+    target: str = DEFAULT_TARGET
+    exclude: tuple[str, ...] = DEFAULT_EXCLUDES
+    prepare: tuple[str, ...] = ()
+    services: tuple[Service, ...] = ()
+    setup: tuple[str, ...] = ()
+    mem_mib: int = 1024
+    disk_mib: int = 2048
+    vcpus: int = 2
+    command_timeout: float = 300.0
+
+
+def find_config(project: Path) -> Path:
+    """``project`` itself if it is a file, else its ``chronobox.toml``."""
+    return project if project.is_file() else project / CONFIG_FILE
+
+
+def load_config(project: Path) -> ProjectConfig:
+    """Read and check a project's ``chronobox.toml``.
+
+    Args:
+        project: The project folder, or the config file itself.
+
+    Raises:
+        ConfigError: If the file is missing, is not valid TOML, or has unknown keys or wrong types.
+    """
+    file = find_config(project).resolve()
+    try:
+        raw = tomllib.loads(file.read_text())
+    except FileNotFoundError as error:
+        raise ConfigError(f"no {CONFIG_FILE} in {project}") from error
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigError(f"{file}: {error}") from error
+    _check_keys(raw, TOP_LEVEL_KEYS, "the top level")
+    base = file.parent
+    machine = _table(raw, "machine", MACHINE_KEYS)
+    project_table = _table(raw, "project", PROJECT_KEYS)
+    services = tuple(_service(entry) for entry in _list(raw, "service", dict))
+    names = [service.name for service in services]
+    if len(set(names)) != len(names):
+        raise ConfigError(f"service names must be unique: {names}")
+    return ProjectConfig(
+        file=file,
+        image=_image(raw.get("image", DEFAULT_IMAGE), base),
+        path=(base / project_table.get("path", ".")).resolve(),
+        target=_absolute(project_table.get("target", DEFAULT_TARGET), "project.target"),
+        exclude=DEFAULT_EXCLUDES + tuple(_list(project_table, "exclude", str)),
+        prepare=tuple(_list(raw, "prepare", str)),
+        services=services,
+        setup=tuple(_list(raw, "setup", str)),
+        mem_mib=int(machine.get("mem_mib", 1024)),
+        disk_mib=int(machine.get("disk_mib", 2048)),
+        vcpus=int(machine.get("vcpus", 2)),
+        command_timeout=float(machine.get("command_timeout", 300.0)),
+    )
+
+
+def _image(value: Any, base: Path) -> ImageSource:
+    if isinstance(value, str):
+        return ImageSource(name=value)
+    if not isinstance(value, dict):
+        raise ConfigError("image must be a name or a table")
+    _check_keys(value, IMAGE_KEYS, "image")
+    if ("reference" in value) == ("dockerfile" in value):
+        raise ConfigError("image needs exactly one of reference or dockerfile")
+    if "reference" in value:
+        reference = value["reference"]
+        return ImageSource(name=value.get("name") or image_name(reference), reference=reference)
+    dockerfile = (base / value["dockerfile"]).resolve()
+    context = (base / value["context"]).resolve() if "context" in value else dockerfile.parent
+    name = value.get("name") or image_name(context.name)
+    return ImageSource(name=name, dockerfile=dockerfile, context=context)
+
+
+def _service(entry: dict[str, Any]) -> Service:
+    _check_keys(entry, SERVICE_KEYS, "service")
+    if not entry.get("name") or not entry.get("start"):
+        raise ConfigError(f"every service needs a name and a start command: {entry}")
+    env = entry.get("env", {})
+    if not all(isinstance(value, str) for value in env.values()):
+        raise ConfigError(f"service {entry['name']}: env values must be strings")
+    return Service(
+        name=entry["name"],
+        start=entry["start"],
+        ready=entry.get("ready", ""),
+        env=dict(env),
+        workdir=entry.get("workdir", ""),
+        restart=bool(entry.get("restart", True)),
+        ready_timeout=float(entry.get("ready_timeout", DEFAULT_READY_TIMEOUT_S)),
+    )
+
+
+def _table(raw: dict[str, Any], key: str, allowed: frozenset[str]) -> dict[str, Any]:
+    table = raw.get(key, {})
+    if not isinstance(table, dict):
+        raise ConfigError(f"{key} must be a table")
+    _check_keys(table, allowed, key)
+    return table
+
+
+def _list(raw: dict[str, Any], key: str, kind: type) -> list[Any]:
+    items = raw.get(key, [])
+    if not isinstance(items, list) or not all(isinstance(item, kind) for item in items):
+        raise ConfigError(f"{key} must be a list of {kind.__name__}")
+    return items
+
+
+def _check_keys(table: dict[str, Any], allowed: frozenset[str], where: str) -> None:
+    unknown = sorted(set(table) - allowed)
+    if unknown:
+        allowed_keys = ", ".join(sorted(allowed))
+        raise ConfigError(f"unknown keys in {where}: {', '.join(unknown)} (allowed: {allowed_keys})")
+
+
+def _absolute(path: str, key: str) -> str:
+    if not path.startswith("/"):
+        raise ConfigError(f"{key} must be an absolute path in the machine: {path!r}")
+    return path.rstrip("/") or "/"
