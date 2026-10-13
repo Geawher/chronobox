@@ -9,6 +9,7 @@ requires-python = ">=3.12"
 dependencies = ["mcp>=2.3.0"]
 
 [project.scripts]
+chronobox = "chronobox.cli:main"
 chronobox-mcp = "chronobox.server:main"
 
 [dependency-groups]
@@ -20,6 +21,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chronobox"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# The tools drive and default image sources, so an installed chronobox can build them.
+"vm/tools" = "chronobox/vm/tools"
+"vm/images" = "chronobox/vm/images"
 
 [tool.ruff]
 line-length = 110

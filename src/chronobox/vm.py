@@ -1,8 +1,9 @@
 """Firecracker microVMs whose snapshots capture the whole machine.
 
-Each VM boots a shared read-only root filesystem (``vda``) with a small writable
-disk (``vdb``) layered on top by an overlay, and runs a guest agent that executes
-shell commands sent over vsock. A snapshot pauses the VM, saves its memory and
+Each VM boots the shared read-only tools drive (``vda``: init and guest agent), mounts
+its image (``vdb``, the root filesystem of a Docker image, read-only, see
+``chronobox.images``) under a small writable disk (``vdc``) with an overlay, and runs
+shell commands sent over vsock inside that image. A snapshot pauses the VM, saves its memory and
 device state plus a sparse copy of the writable disk, and resumes it, so running
 processes, open connections, page cache and in-memory data all survive a
 restore. Restoring the same snapshot twice gives two independent machines.
@@ -26,10 +27,21 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from chronobox.images import DEFAULT_IMAGE, TOOLS_DISK, image_disk
+
 GUEST_PORT = 5000
 GUEST_CID = 3
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off quiet init=/sbin/chronobox-init"
-VM_FILES = ("firecracker", "vmlinux", "rootfs.ext4")
+VM_FILES = ("firecracker", "vmlinux", TOOLS_DISK)
+IMAGE_LINK = "image.ext4"
+DATA_DISK = "data.ext4"
+# (drive id, file in the VM's directory, root device, read-only): the guest sees them as vda, vdb
+# and vdc in this order, which the tools drive's init relies on.
+DRIVES = (
+    ("tools", TOOLS_DISK, True, True),
+    ("image", IMAGE_LINK, False, True),
+    ("data", DATA_DISK, False, False),
+)
 SETUP_TIMEOUT_S = 300.0
 GUEST_CONNECT_TIMEOUT_S = 5.0
 GUEST_REPLY_MARGIN_S = 30.0
@@ -46,7 +58,7 @@ class VMError(RuntimeError):
 
 
 def default_vm_dir() -> Path:
-    """Where the Firecracker binary, kernel and root disk live.
+    """Where the Firecracker binary, kernel, tools drive and images live.
 
     ``CHRONOBOX_VM_DIR`` wins; then ``vm/build`` of a source checkout, if built; then
     ``$XDG_DATA_HOME/chronobox/vm`` (``~/.local/share/chronobox/vm``), where an installed
@@ -68,6 +80,7 @@ class MachineSpec:
 
     Attributes:
         setup: Shell commands run once after boot, in order (start services, load data).
+        image: Name of the machine's image (``chronobox build``); snapshots keep it.
         mem_mib: Guest memory; allocated lazily by the host.
         vcpus: Virtual CPUs.
         data_mib: Size of the sparse writable disk.
@@ -75,6 +88,7 @@ class MachineSpec:
     """
 
     setup: tuple[str, ...] = ()
+    image: str = DEFAULT_IMAGE
     mem_mib: int = 1024
     vcpus: int = 2
     data_mib: int = 2048
@@ -190,8 +204,10 @@ class FirecrackerBackend:
         Raises:
             VMError: If the VM does not boot or a setup command fails.
         """
+        if not image_disk(self.vm_dir, spec.image).exists():
+            raise VMError(f"image {spec.image!r} is not built in {self.vm_dir}: run `chronobox build`")
         machine = self._new_machine(spec)
-        await asyncio.to_thread(self._make_data_disk, machine.workdir / "data.ext4", spec.data_mib)
+        await asyncio.to_thread(self._make_data_disk, machine.workdir / DATA_DISK, spec.data_mib)
         await self._launch(machine)
         await self._configure_and_boot(machine)
         await machine.wait_ready()
@@ -216,7 +232,7 @@ class FirecrackerBackend:
                 "snapshot_path": str(store / "vm.snap"),
                 "mem_file_path": str(store / "vm.mem"),
             })  # fmt: skip
-            await asyncio.to_thread(_sparse_copy, machine.workdir / "data.ext4", store / "data.ext4")
+            await asyncio.to_thread(_sparse_copy, machine.workdir / DATA_DISK, store / DATA_DISK)
         finally:
             await _api(machine.api_socket, "PATCH", "/vm", {"state": "Resumed"})
         self._specs[key] = machine.spec
@@ -229,7 +245,7 @@ class FirecrackerBackend:
         started = time.monotonic()
         store = self.root / "snapshots" / snapshot.key
         machine = self._new_machine(self._specs[snapshot.key])
-        await asyncio.to_thread(_sparse_copy, store / "data.ext4", machine.workdir / "data.ext4")
+        await asyncio.to_thread(_sparse_copy, store / DATA_DISK, machine.workdir / DATA_DISK)
         await self._launch(machine)
         await _api(machine.api_socket, "PUT", "/snapshot/load", {
             "snapshot_path": str(store / "vm.snap"),
@@ -262,10 +278,10 @@ class FirecrackerBackend:
         spec = machine.spec
         api = machine.api_socket
         await _api(api, "PUT", "/boot-source", {"kernel_image_path": "vmlinux", "boot_args": BOOT_ARGS})
-        for drive_id, path, is_root in (("rootfs", "rootfs.ext4", True), ("data", "data.ext4", False)):
+        for drive_id, path, is_root, is_read_only in DRIVES:
             await _api(api, "PUT", f"/drives/{drive_id}", {
                 "drive_id": drive_id, "path_on_host": path,
-                "is_root_device": is_root, "is_read_only": is_root,
+                "is_root_device": is_root, "is_read_only": is_read_only,
             })  # fmt: skip
         await _api(api, "PUT", "/machine-config", {"vcpu_count": spec.vcpus, "mem_size_mib": spec.mem_mib})
         await _api(api, "PUT", "/vsock", {"guest_cid": GUEST_CID, "uds_path": "v.sock"})
@@ -274,8 +290,9 @@ class FirecrackerBackend:
     def _new_machine(self, spec: MachineSpec) -> Machine:
         workdir = self.root / "vms" / f"vm{next(self._ids)}"
         workdir.mkdir(parents=True)
-        for name in ("vmlinux", "rootfs.ext4"):
+        for name in ("vmlinux", TOOLS_DISK):
             (workdir / name).symlink_to(self.vm_dir / name)
+        (workdir / IMAGE_LINK).symlink_to(image_disk(self.vm_dir, spec.image))
         machine = Machine(workdir, spec)
         self._live.add(machine)
         return machine

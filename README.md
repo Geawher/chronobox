@@ -52,8 +52,8 @@ nothing to break, expect little difference. Full results, per-task tables and me
 ## Requirements
 
 Linux with KVM (read/write access to `/dev/kvm`, e.g. membership of the `kvm`
-group), Python 3.12 with [uv](https://docs.astral.sh/uv/), and Docker once to build
-the VM image. No root needed. macOS and Windows are not supported (Firecracker needs
+group), Python 3.12 with [uv](https://docs.astral.sh/uv/), and Docker to build
+images. No root needed. macOS and Windows are not supported (Firecracker needs
 KVM); a Linux VM with nested virtualization or a remote Linux box works.
 
 ## Quickstart
@@ -62,7 +62,7 @@ KVM); a Linux VM with nested virtualization or a remote Linux box works.
 git clone https://github.com/Geawher/chronobox && cd chronobox
 uv sync
 vm/fetch.sh            # Firecracker + guest kernel into vm/build
-vm/build_rootfs.sh     # Debian root disk: Python, PostgreSQL, nginx, git, sqlite, uv...
+vm/build_rootfs.sh     # the tools drive + the default image (Debian: Python, PostgreSQL, nginx...)
 uv run pytest          # includes real-VM tests
 
 claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp
@@ -71,12 +71,29 @@ claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp
 Each Claude Code session then gets a fresh machine (boot ≈ 1 s). Any MCP client
 works the same way.
 
-The VM image goes to `vm/build` of the checkout. To put it elsewhere (or when chronobox
+The VM files go to `vm/build` of the checkout. To put them elsewhere (or when chronobox
 is installed as a package, e.g. by chronobox-ops), set `CHRONOBOX_VM_DIR` for both the
 build scripts and chronobox; an installed chronobox without it looks in
 `~/.local/share/chronobox/vm`.
 
-Options: `--profile alone|rollback|chronobox` (default `chronobox`), `--guard`,
+### Your own image
+
+Any Docker image can be the machine's system, from a registry or from your Dockerfile:
+
+```bash
+uv run chronobox build --image postgres:16                      # -> image "postgres-16"
+uv run chronobox build --dockerfile ./Dockerfile --name myapp   # context: the Dockerfile's folder
+uv run chronobox images
+claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp --image myapp
+```
+
+The image needs nothing from chronobox (no Python, no init): commands run inside it
+with its own shell (bash if it has one, else `sh`), its `ENV` and its `WORKDIR`, as
+root. Nothing is started automatically; start the image's services from `--setup` or
+let the agent do it (e.g. `docker-entrypoint.sh postgres &` in the postgres image).
+
+Options: `--image NAME` (default `default`), `--profile alone|rollback|chronobox`
+(default `chronobox`), `--guard`,
 `--setup script.sh` (prepare the machine at boot: install, start services, load
 data), `--mem`, `--disk`.
 
@@ -113,8 +130,10 @@ the chronobox-ops benchmark measures what agents do.
 
 ## How it works
 
-Each machine is a Firecracker microVM: a shared read-only root disk, a sparse
-writable disk on top (overlay), and a guest agent reached over vsock. A snapshot
+Each machine is a Firecracker microVM that boots a small shared **tools drive**
+(init and guest agent, Alpine), mounts the machine's **image** (read-only) under a
+sparse writable disk (overlay), and runs the agent's commands inside the image with
+chroot; the guest agent is reached over vsock. A snapshot
 pauses the VM for well under a second, saves memory and device state plus the
 changed disk blocks, and resumes it; restoring starts a new VM from those files.
 Only running machines (main + open forks) use RAM, and guest memory is allocated
@@ -138,7 +157,8 @@ lazily; checkpoints are files on disk.
 ```
 src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints, forks,
                  reports, lessons, guard) · commands.py · service.py · server.py (MCP)
-vm/              image (Dockerfile, init, guest agent) · fetch.sh · build_rootfs.sh
+                 images.py · cli.py (`chronobox build` / `images`)
+vm/              tools/ (tools drive: init, guest agent) · images/default/ · fetch.sh · build_rootfs.sh
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
 ```
 

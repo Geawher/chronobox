@@ -1,6 +1,7 @@
 """The MCP server over real stdio, in each of its modes."""
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from chronobox.service import WorkspaceService, request
 from chronobox.workspace import Profile
 
 SERVER = [sys.executable, "-m", "chronobox.server"]
+# The MCP client starts servers with a minimal environment; keep CHRONOBOX_VM_DIR and the rest.
+SERVER_ENV = dict(os.environ)
 
 
 async def text(session: ClientSession, tool: str, **arguments: object) -> str:
@@ -43,7 +46,9 @@ async def test_profiles_expose_only_their_tools() -> None:
 
 @pytest.mark.vm
 async def test_local_mode_forks_and_promotes(tmp_path: Path) -> None:
-    params = StdioServerParameters(command=SERVER[0], args=[*SERVER[1:], "--root", str(tmp_path / "vms")])
+    params = StdioServerParameters(
+        command=SERVER[0], args=[*SERVER[1:], "--root", str(tmp_path / "vms")], env=SERVER_ENV
+    )
     async with stdio_client(params) as streams, ClientSession(*streams) as session:
         await session.initialize()
         assert "v1" in await text(session, "run", command="echo v1 | tee /root/f")
@@ -66,7 +71,9 @@ async def test_served_machine_outlives_its_front_end(tmp_path: Path) -> None:
             await asyncio.sleep(0.2)
         assert (await request(socket, {"op": "status"}))["error"] is None
         params = StdioServerParameters(
-            command=SERVER[0], args=[*SERVER[1:], "--connect", str(socket), "--profile", "rollback"]
+            command=SERVER[0],
+            args=[*SERVER[1:], "--connect", str(socket), "--profile", "rollback"],
+            env=SERVER_ENV,
         )
         async with stdio_client(params) as streams, ClientSession(*streams) as session:
             await session.initialize()
@@ -89,6 +96,7 @@ async def test_setup_script_prepares_the_machine(tmp_path: Path) -> None:
     params = StdioServerParameters(
         command=SERVER[0],
         args=[*SERVER[1:], "--profile", "alone", "--setup", str(setup), "--root", str(tmp_path / "vms")],
+        env=SERVER_ENV,
     )
     async with stdio_client(params) as streams, ClientSession(*streams) as session:
         await session.initialize()

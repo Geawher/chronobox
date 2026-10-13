@@ -7,10 +7,14 @@ gets one JSON reply line:
     {"op": "run", "command": "...", "timeout": 60}  -> {"code": 0, "output": "..."}
     {"op": "run", ..., "isolated": true}            -> same
 
-Commands run with bash; the working directory and exported variables persist
-between commands (saved in /root/.chronobox, so they are part of every
-snapshot), so these commands run one at a time. Background processes keep
-running: the whole VM (memory and processes) is what chronobox snapshots.
+The agent runs from the tools drive; commands run inside the machine's image
+(mounted at /newroot) through chroot, with the image's shell (bash if it has
+one, else sh) and the environment and working directory from its Docker config
+(``/.chronobox/image.json`` in the image, written by ``chronobox build``). The
+working directory and exported variables persist between commands (saved in
+/root/.chronobox, so they are part of every snapshot), so these commands run one
+at a time. Background processes keep running: the whole VM (memory and
+processes) is what chronobox snapshots.
 
 Isolated commands are for observers (health probes, checkers): they run next to
 the others, in a private mount namespace, without the shared state, and read
@@ -18,41 +22,66 @@ their script from stdin, so it never shows in the process list or environment.
 Mounts they make are invisible to every other process.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import socket
 import subprocess
 import tempfile
 import threading
+from pathlib import Path
 
 PORT = 5000
+ROOT = Path("/newroot")
+IMAGE_CONFIG = ROOT / ".chronobox" / "image.json"
+SHELLS = ("/bin/bash", "/bin/sh")
+DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+DEFAULT_WORKDIR = "/root"
 STATE = "/root/.chronobox"
-WRAPPER = f"""
-S={STATE}
+WRAPPER = """
+S={state}
 mkdir -p $S
-cd "$(cat $S/cwd 2>/dev/null || echo /root)" 2>/dev/null
+cd "$(cat $S/cwd 2>/dev/null || echo {workdir})" 2>/dev/null
 [ -f $S/env ] && . $S/env >/dev/null 2>&1
 eval "$CHRONOBOX_CMD" </dev/null
 __rc=$?
 pwd > $S/cwd; export -p | grep -v ' CHRONOBOX_CMD=' > $S/env
 exit $__rc
 """
-ISOLATED = ["unshare", "--mount", "--propagation", "private", "bash", "-s"]
 shared_state = threading.Lock()
 
 
+def load_image_config() -> dict:
+    try:
+        return json.loads(IMAGE_CONFIG.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def pick_shell() -> str:
+    # The image's own files decide, so look under the image root, not on this drive.
+    return next(shell for shell in SHELLS if (ROOT / shell.lstrip("/")).exists())
+
+
+IMAGE = load_image_config()
+SHELL = pick_shell()
+WORKDIR = IMAGE.get("workdir") or DEFAULT_WORKDIR
+ENV = {"PATH": DEFAULT_PATH, **IMAGE.get("env", {}), "HOME": "/root", "TERM": "dumb"}
+SHARED = ["chroot", str(ROOT), SHELL, "-c", WRAPPER.format(state=STATE, workdir=WORKDIR)]
+ISOLATED = ["unshare", "--mount", "--propagation", "private", "chroot", str(ROOT), SHELL, "-s"]
+
+
 def run(command: str, timeout: float, *, isolated: bool = False) -> dict:
-    env = {**os.environ, "HOME": "/root", "TERM": "dumb"}
-    env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     if isolated:
-        # The script is a single braced group: bash parses all of it before running it,
+        # The script is a single braced group: the shell parses all of it before running it,
         # so nothing it starts can read the rest of the script from stdin.
-        return execute(ISOLATED, env, timeout, script=f"cd /root\n{{\n{command}\n}} </dev/null\n")
+        return execute(ISOLATED, ENV, timeout, script=f"cd /root\n{{\n{command}\n}} </dev/null\n")
     with shared_state:
-        return execute(["bash", "-c", WRAPPER], {**env, "CHRONOBOX_CMD": command}, timeout, script=None)
+        return execute(SHARED, {**ENV, "CHRONOBOX_CMD": command}, timeout, script=None)
 
 
-def execute(argv: list, env: dict, timeout: float, *, script: str | None) -> dict:
+def execute(argv: list[str], env: dict[str, str], timeout: float, *, script: str | None) -> dict:
     # Output goes to a file, not a pipe: background services started by the
     # command keep the descriptor open, and we must not wait for them.
     with tempfile.TemporaryFile() as out:
@@ -103,7 +132,7 @@ def serve(connection: socket.socket) -> None:
 
 
 def main() -> None:
-    os.environ.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    os.environ.setdefault("PATH", DEFAULT_PATH)
     server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     server.bind((socket.VMADDR_CID_ANY, PORT))
     server.listen(16)
