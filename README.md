@@ -2,6 +2,15 @@
 
 **A Linux machine with exact undo and forks, for coding agents — as an MCP server.**
 
+**Let an agent test its reasoning on a copy of reality before it acts.** When an agent
+works on a live system, each step of its plan is a guess: "this migration is safe under
+traffic", "this setting stops the out-of-memory kills". Usually the only way to check a
+guess is to run it in production. With chronobox the agent forks the running machine,
+runs the step on the exact copy, watches what happens, and changes the real machine only
+once the copy shows it works. If something still goes wrong, it can roll the whole
+machine back. In our benchmark this made models safer, and let a cheaper model match a
+stronger one ([below](#does-it-help)).
+
 Agents that work on real systems (upgrade a dependency, migrate a database, change
 a live config) make mistakes that cannot be undone with `git`: data is gone, a
 service restarted and lost its in-memory state, clients were told their writes
@@ -18,6 +27,27 @@ succeeded. chronobox gives the agent a machine where those mistakes are cheap:
   until they succeeded on a fork (or are forced).
 
 There is no search or autopilot inside: the agent decides when to use the tools.
+
+## Does it help?
+
+We measured it on [chronobox-ops](https://github.com/Geawher/chronobox-ops), our benchmark
+of 34 tasks on live production machines. Each task has a hazard a careful engineer
+avoids: traffic that must keep flowing, writes that must not be lost, a setting that only
+looks safe. Claude Code with chronobox, compared with the same Claude Code alone:
+
+- **A cheaper model matches a stronger one.** Sonnet 5.5 with chronobox does the task
+  on 86% of runs and harms users on 12%, against 82% and 13% for Opus 4.8 alone, at
+  $0.13 per run instead of $1.09. The 95% intervals of the differences, [−3, +13] and
+  [−7, +5] points, leave no gap we can measure.
+- **The same model is safer.** Sonnet 5.5 succeeds on 14 points more runs and harms users
+  half as often (72% → 86%; 26% → 12%), both outside chance. Sonnet 5 (+11 points) and
+  Opus 4.8 (+7) gain too.
+- **The strongest model does not need it.** Opus 5.5 succeeds on 96% of runs alone, often
+  by building its own test copy, and gains nothing.
+
+The benchmark is ours, and its tasks are built around such hazards: on routine work with
+nothing to break, expect little difference. Full results, per-task tables and method:
+[chronobox-ops results](https://github.com/Geawher/chronobox-ops/blob/main/results/README.md).
 
 ## Requirements
 
