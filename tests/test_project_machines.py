@@ -147,3 +147,36 @@ async def test_the_mcp_server_serves_a_project_with_diff_and_export(
         assert {"diff", "export"} <= tools
         result = await session.call_tool("diff", {})
         assert "no changes" in "".join(getattr(part, "text", "") for part in result.content)
+
+
+POSTGRES = "postgres-16"
+POSTGRES_PROJECT = """
+image = "postgres-16"
+setup = ["psql -h 127.0.0.1 -U postgres -f seed.sql"]
+
+[[service]]
+name = "db"
+start = "docker-entrypoint.sh postgres"
+ready = "pg_isready -q -h 127.0.0.1 -U postgres"
+env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
+"""
+
+
+@pytest.mark.skipif(not image_disk(default_vm_dir(), POSTGRES).exists(), reason=f"image {POSTGRES} not built")
+async def test_a_project_on_the_postgres_image_starts_its_entrypoint_and_starts_warm(tmp_path: Path) -> None:
+    folder = tmp_path / "orders-db"
+    folder.mkdir()
+    (folder / "chronobox.toml").write_text(POSTGRES_PROJECT)
+    (folder / "seed.sql").write_text("create table orders (item text); insert into orders values ('kept');\n")
+    project = load_config(folder)
+    for session in ("first", "second"):
+        backend = FirecrackerBackend(tmp_path / f"vms-{session}")
+        try:
+            workspace, boot = await start(backend, project, tmp_path / "warm")
+            assert boot.was_warm is (session == "second")
+            assert (
+                await output(workspace, "psql -h 127.0.0.1 -U postgres -tAc 'select item from orders'")
+                == "kept"
+            )
+        finally:
+            await backend.cleanup()
