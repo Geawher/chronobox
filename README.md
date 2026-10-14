@@ -88,9 +88,13 @@ claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp --image myapp
 ```
 
 The image needs nothing from chronobox (no Python, no init): commands run inside it
-with its own shell (bash if it has one, else `sh`), its `ENV` and its `WORKDIR`, as
-root. Nothing is started automatically; start the image's services from `--setup` or
-let the agent do it (e.g. `docker-entrypoint.sh postgres &` in the postgres image).
+with its own shell (bash if it has one, else `sh`; images without either are refused),
+its `ENV` and its `WORKDIR`, as root (the image's `USER` is not used). Nothing is
+started automatically; start the image's services from `--setup` or let the agent do it (e.g. `docker-entrypoint.sh postgres &` in the postgres image).
+
+Rebuilding an image never changes the disk under a running or saved machine: each machine
+and snapshot keeps a hard link to the disk it was made on (a symlink if the VMs live on
+another filesystem than the VM files).
 
 Options: `--image NAME` (default `default`), `--profile alone|rollback|chronobox`
 (default `chronobox`), `--guard`,

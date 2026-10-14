@@ -6,10 +6,17 @@ mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mount -t tmpfs tmpfs /tmp
-mount -t ext4 -o ro /dev/vdb /image
-mount -t ext4 /dev/vdc /data
+# Without these three the machine cannot work: say why on the console (the host shows its
+# tail) and power off, instead of letting the host wait for an agent that never starts.
+fail() {
+  echo "chronobox init: $1" >&2
+  poweroff -f
+}
+mount -t ext4 -o ro /dev/vdb /image || fail "cannot mount the image disk (vdb)"
+mount -t ext4 /dev/vdc /data || fail "cannot mount the data disk (vdc)"
 mkdir -p /data/upper /data/work
-mount -t overlay overlay -o lowerdir=/image,upperdir=/data/upper,workdir=/data/work /newroot
+mount -t overlay overlay -o lowerdir=/image,upperdir=/data/upper,workdir=/data/work /newroot ||
+  fail "cannot mount the overlay"
 mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/tmp /newroot/run /newroot/root /newroot/etc
 mount -t proc proc /newroot/proc
 mount -t sysfs sys /newroot/sys
@@ -24,11 +31,14 @@ ln -sf /proc/self/fd/1 /newroot/dev/stdout
 ln -sf /proc/self/fd/2 /newroot/dev/stderr
 # /tmp and /run live in memory as on a booted Linux, seeded with what the image put there
 # (e.g. /run/postgresql), since some images create directories there at build time.
+# An image that makes them symlinks keeps its choice: from out here an absolute link would
+# resolve on the tools drive, not in the image.
 for dir in tmp run; do
+  [ -L /image/$dir ] && continue
   mount -t tmpfs tmpfs /newroot/$dir
   [ -d /image/$dir ] && cp -a /image/$dir/. /newroot/$dir/
 done
-chmod 1777 /newroot/tmp
+[ -L /image/tmp ] || chmod 1777 /newroot/tmp
 ip link set lo up
 hostname chronobox
 printf "127.0.0.1 localhost chronobox\n::1 localhost\n" > /newroot/etc/hosts

@@ -15,6 +15,7 @@ disk, happen inside a container of the tools image.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -38,6 +39,8 @@ DISK_MARGIN_PERCENT = 20
 DISK_MARGIN_MIB = 128
 INODE_MARGIN = 4096
 _NAME_ALLOWED = re.compile(r"[^a-z0-9._-]+")
+# One folder under images/ and a valid Docker tag (the Dockerfile build tags with it).
+IMAGE_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 # Runs in a tools container with the work directory mounted at /work: unpack as root so file
 # owners survive, size the disk to fit, write it, and hand it back to the host user.
@@ -45,6 +48,15 @@ _MAKE_DISK = """
 set -e
 mkdir /tmp/root
 tar -xf /work/rootfs.tar -C /tmp/root --numeric-owner
+# Every command runs with the image's own shell (links count: they resolve inside the image).
+has_shell=no
+for shell in /tmp/root/bin/sh /tmp/root/bin/bash; do
+  if [ -e $shell ] || [ -L $shell ]; then has_shell=yes; fi
+done
+if [ $has_shell = no ]; then
+  echo "the image has no /bin/sh or /bin/bash; chronobox runs every command with the image's shell" >&2
+  exit 3
+fi
 if [ -f /work/image.json ]; then
   mkdir -p /tmp/root/.chronobox && cp /work/image.json /tmp/root/.chronobox/image.json
 fi
@@ -115,6 +127,17 @@ def image_name(reference: str) -> str:
     return _NAME_ALLOWED.sub("-", last.replace(":", "-").replace("@", "-")).strip("-.")
 
 
+def check_image_name(name: str) -> str:
+    """Return ``name`` if it is a usable image name.
+
+    Raises:
+        ImageError: If ``name`` is not lowercase letters, digits, ``.``, ``_`` and ``-``.
+    """
+    if not IMAGE_NAME.fullmatch(name):
+        raise ImageError(f"bad image name {name!r}: use lowercase letters, digits, '.', '_' and '-'")
+    return name
+
+
 def image_dir(vm_dir: Path, name: str) -> Path:
     return vm_dir / IMAGES_DIR / name
 
@@ -183,12 +206,12 @@ def build_image(
         raise ImageError(f"no tools drive in {vm_dir}: run `chronobox build --tools` first")
     if dockerfile is not None:
         context = context or dockerfile.parent
-        name = name or image_name(context.resolve().name)
+        name = check_image_name(name or image_name(context.resolve().name))
         reference = f"{IMAGE_TAG_PREFIX}{name}:latest"
         _docker("build", "-q", "-f", str(dockerfile), "-t", reference, str(context))
         source = str(dockerfile)
     else:
-        name = name or image_name(reference)
+        name = check_image_name(name or image_name(reference))
         _pull_if_missing(reference)
         source = reference
     inspected = json.loads(_docker("image", "inspect", "--format", "{{json .Config}}", reference))
@@ -208,8 +231,12 @@ def _export_disk(reference: str, target: Path, *, config: ImageConfig | None) ->
         container = _docker("create", reference, EXPORT_COMMAND).strip()
         try:
             _docker("export", container, "-o", str(work / "rootfs.tar"))
-        finally:
-            _docker("rm", container)
+        except ImageError:
+            # The export failure is the one to report; a container left behind is minor.
+            with contextlib.suppress(ImageError):
+                _docker("rm", "-f", container)
+            raise
+        _docker("rm", "-f", container)
         if config is not None:
             config.save(work / IMAGE_CONFIG)
         script = _MAKE_DISK.format(
@@ -218,7 +245,8 @@ def _export_disk(reference: str, target: Path, *, config: ImageConfig | None) ->
             margin_mib=DISK_MARGIN_MIB,
             owner=f"{os.getuid()}:{os.getgid()}",
         )
-        _docker("run", "--rm", "-v", f"{work}:/work", "--entrypoint", "sh", TOOLS_TAG, "-c", script)
+        mount = f"type=bind,source={work},target=/work"
+        _docker("run", "--rm", "--mount", mount, "--entrypoint", "sh", TOOLS_TAG, "-c", script)
         # Replace in one step, so a machine never boots a half-written disk.
         (work / "disk.ext4").replace(target)
 

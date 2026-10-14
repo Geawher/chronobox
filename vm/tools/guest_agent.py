@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import subprocess
 import tempfile
@@ -39,14 +40,19 @@ SHELLS = ("/bin/bash", "/bin/sh")
 DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 DEFAULT_WORKDIR = "/root"
 STATE = "/root/.chronobox"
+# The command arrives in CHRONOBOX_CMD and leaves the environment before it runs: saved
+# exports must never hold it (dash and busybox print a multi-line value over several lines,
+# which no line filter can drop, and sourcing them would run its tail again).
 WRAPPER = """
 S={state}
 mkdir -p $S
 cd "$(cat $S/cwd 2>/dev/null || echo {workdir})" 2>/dev/null
 [ -f $S/env ] && . $S/env >/dev/null 2>&1
-eval "$CHRONOBOX_CMD" </dev/null
+__chronobox_cmd=$CHRONOBOX_CMD
+unset CHRONOBOX_CMD
+eval "$__chronobox_cmd" </dev/null
 __rc=$?
-pwd > $S/cwd; export -p | grep -v ' CHRONOBOX_CMD=' > $S/env
+pwd > $S/cwd; export -p > $S/env
 exit $__rc
 """
 shared_state = threading.Lock()
@@ -60,15 +66,25 @@ def load_image_config() -> dict:
 
 
 def pick_shell() -> str:
-    # The image's own files decide, so look under the image root, not on this drive.
-    return next(shell for shell in SHELLS if (ROOT / shell.lstrip("/")).exists())
+    """The image's shell: bash if it has one, else sh.
+
+    The image's own files decide, so look under the image root, not on this drive; lexists,
+    because an absolute symlink (e.g. /bin/sh -> /usr/bin/dash) only resolves inside the image.
+
+    Raises:
+        SystemExit: If the image has neither (``chronobox build`` refuses such images).
+    """
+    shell = next((shell for shell in SHELLS if os.path.lexists(ROOT / shell.lstrip("/"))), None)
+    if shell is None:
+        raise SystemExit(f"chronobox guest agent: the image has no shell ({', '.join(SHELLS)})")
+    return shell
 
 
 IMAGE = load_image_config()
 SHELL = pick_shell()
 WORKDIR = IMAGE.get("workdir") or DEFAULT_WORKDIR
 ENV = {"PATH": DEFAULT_PATH, **IMAGE.get("env", {}), "HOME": "/root", "TERM": "dumb"}
-SHARED = ["chroot", str(ROOT), SHELL, "-c", WRAPPER.format(state=STATE, workdir=WORKDIR)]
+SHARED = ["chroot", str(ROOT), SHELL, "-c", WRAPPER.format(state=STATE, workdir=shlex.quote(WORKDIR))]
 ISOLATED = ["unshare", "--mount", "--propagation", "private", "chroot", str(ROOT), SHELL, "-s"]
 
 

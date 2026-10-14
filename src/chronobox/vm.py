@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
 import itertools
 import json
 import os
@@ -27,13 +28,16 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from chronobox.images import DEFAULT_IMAGE, TOOLS_DISK, image_disk
+from chronobox.images import DEFAULT_IMAGE, IMAGE_NAME, TOOLS_DISK, image_disk
 
 GUEST_PORT = 5000
 GUEST_CID = 3
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 pci=off quiet init=/sbin/chronobox-init"
 VM_FILES = ("firecracker", "vmlinux", TOOLS_DISK)
 IMAGE_LINK = "image.ext4"
+LINK_REFUSED = (errno.EXDEV, errno.EPERM, errno.EACCES)
+# Read-only disks every machine shares with the VM files; snapshots keep links to them.
+SHARED_DISKS = (TOOLS_DISK, IMAGE_LINK)
 DATA_DISK = "data.ext4"
 # (drive id, file in the VM's directory, root device, read-only): the guest sees them as vda, vdb
 # and vdc in this order, which the tools drive's init relies on.
@@ -204,7 +208,7 @@ class FirecrackerBackend:
         Raises:
             VMError: If the VM does not boot or a setup command fails.
         """
-        if not image_disk(self.vm_dir, spec.image).exists():
+        if not IMAGE_NAME.fullmatch(spec.image) or not image_disk(self.vm_dir, spec.image).exists():
             raise VMError(f"image {spec.image!r} is not built in {self.vm_dir}: run `chronobox build`")
         machine = self._new_machine(spec)
         await asyncio.to_thread(self._make_data_disk, machine.workdir / DATA_DISK, spec.data_mib)
@@ -233,6 +237,8 @@ class FirecrackerBackend:
                 "mem_file_path": str(store / "vm.mem"),
             })  # fmt: skip
             await asyncio.to_thread(_sparse_copy, machine.workdir / DATA_DISK, store / DATA_DISK)
+            for disk in SHARED_DISKS:
+                _link_disk(machine.workdir / disk, store / disk)
         finally:
             await _api(machine.api_socket, "PATCH", "/vm", {"state": "Resumed"})
         self._specs[key] = machine.spec
@@ -244,7 +250,7 @@ class FirecrackerBackend:
         """Start a new, independent machine from a snapshot."""
         started = time.monotonic()
         store = self.root / "snapshots" / snapshot.key
-        machine = self._new_machine(self._specs[snapshot.key])
+        machine = self._new_machine(self._specs[snapshot.key], store)
         await asyncio.to_thread(_sparse_copy, store / DATA_DISK, machine.workdir / DATA_DISK)
         await self._launch(machine)
         await _api(machine.api_socket, "PUT", "/snapshot/load", {
@@ -287,12 +293,16 @@ class FirecrackerBackend:
         await _api(api, "PUT", "/vsock", {"guest_cid": GUEST_CID, "uds_path": "v.sock"})
         await _api(api, "PUT", "/actions", {"action_type": "InstanceStart"})
 
-    def _new_machine(self, spec: MachineSpec) -> Machine:
+    def _new_machine(self, spec: MachineSpec, store: Path | None = None) -> Machine:
+        """A machine folder; a restored machine gets the exact disks its snapshot was taken on."""
         workdir = self.root / "vms" / f"vm{next(self._ids)}"
         workdir.mkdir(parents=True)
-        for name in ("vmlinux", TOOLS_DISK):
-            (workdir / name).symlink_to(self.vm_dir / name)
-        (workdir / IMAGE_LINK).symlink_to(image_disk(self.vm_dir, spec.image))
+        (workdir / "vmlinux").symlink_to(self.vm_dir / "vmlinux")
+        current = {TOOLS_DISK: self.vm_dir / TOOLS_DISK, IMAGE_LINK: image_disk(self.vm_dir, spec.image)}
+        for disk in SHARED_DISKS:
+            saved = store / disk if store is not None else None
+            # Snapshots from before disks were linked into them use the current disks.
+            _link_disk(saved if saved is not None and saved.exists() else current[disk], workdir / disk)
         machine = Machine(workdir, spec)
         self._live.add(machine)
         return machine
@@ -356,6 +366,18 @@ async def _api(socket_path: Path, method: str, path: str, body: dict[str, object
 def _die_with_parent() -> None:
     """Make the kernel kill the VM if the process that launched it dies, even by SIGKILL."""
     ctypes.CDLL(None).prctl(_PR_SET_PDEATHSIG, _SIGKILL)
+
+
+def _link_disk(disk: Path, link: Path) -> None:
+    """Hard link, so the file stays the one a machine booted even after ``chronobox build``
+    replaces it (a VM's memory holds caches of that exact disk); a symlink where hard links are
+    impossible (another filesystem, or VM files owned by another user)."""
+    try:
+        os.link(disk, link)
+    except OSError as error:
+        if error.errno not in LINK_REFUSED:
+            raise
+        link.symlink_to(disk.resolve())
 
 
 def _sparse_copy(source: Path, target: Path) -> None:
