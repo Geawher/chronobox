@@ -89,13 +89,19 @@ async def test_project_comes_up_then_starts_warm(project: ProjectConfig, tmp_pat
 async def test_a_change_on_a_fork_comes_back_as_a_patch(
     project: ProjectConfig, backend: FirecrackerBackend, tmp_path: Path
 ) -> None:
-    workspace, _ = await start(backend, project, tmp_path / "warm")
+    workspace, boot = await start(backend, project, tmp_path / "warm")
+    baseline = boot.baseline.read_bytes()
     await workspace.fork("newest-first")
     await workspace.run("sed -i 's/order by id\"/order by id desc\"/' app.py", where="newest-first")
-    patch = await project_diff(workspace.machine("newest-first"), project)
+    # A local edit since the copy was made stays out of the patch.
+    (project.path / "migrate.py").write_text("# edited locally\n")
+    patch = await project_diff(workspace.machine("newest-first"), project, baseline)
     changed = [line for line in patch.splitlines() if line.startswith("+") and "order by" in line]
     assert "--- a/app.py" in patch and len(changed) == 1 and "order by id desc" in changed[0]
-    assert await project_diff(workspace.machine(), project) == ""
+    assert "migrate.py" not in patch
+    assert await project_diff(workspace.machine(), project, baseline) == ""
+    subprocess.run(["git", "apply", "-"], cwd=project.path, input=patch, text=True, check=True)
+    assert "order by id desc" in (project.path / "app.py").read_text()
     exported = await export(workspace.machine("newest-first"), project, "/src/app.py", "newest-first")
     assert exported == project.path / ".chronobox" / "exports" / "newest-first" / "src" / "app.py"
     assert "order by id desc" in exported.read_text()

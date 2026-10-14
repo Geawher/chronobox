@@ -111,14 +111,14 @@ class WorkspaceService:
     async def _put(self, request: dict[str, Any], archive: bytes) -> dict[str, Any]:
         try:
             await (await self._machine(request)).put(request["path"], archive)
-        except (WorkspaceError, VMError) as error:
+        except (WorkspaceError, VMError, OSError, ValueError) as error:  # OSError: guest timeouts
             return {"error": str(error)}
         return {"ok": True}
 
     async def _get(self, request: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
         try:
             archive = await (await self._machine(request)).get(request["path"])
-        except (WorkspaceError, VMError) as error:
+        except (WorkspaceError, VMError, OSError, ValueError) as error:  # OSError: guest timeouts
             return {"error": str(error)}, b""
         return {"size": len(archive)}, archive
 

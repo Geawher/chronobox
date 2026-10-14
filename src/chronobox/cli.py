@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import os
 import sys
 from pathlib import Path
@@ -114,18 +115,23 @@ async def prepare_warm_start(config: ProjectConfig, vm_dir: Path) -> ProjectBoot
 def up(args: argparse.Namespace) -> None:
     config = load_config(args.project)
     socket_path = up_socket(config)
-    if asyncio.run(is_serving(socket_path)):
-        raise ServiceError(f"{config.path} is already up")
     if len(os.fsencode(socket_path)) > MAX_SOCKET_PATH:
         raise ServiceError(f"socket path too long for a unix socket: {socket_path}; set XDG_RUNTIME_DIR")
     socket_path.parent.mkdir(parents=True, exist_ok=True)
-    os.environ["CHRONOBOX_VM_DIR"] = str(args.vm_dir)
-    warm_option = ["--no-warm"] if args.no_warm else []
-    try:
-        server.main(["--project", str(config.path), "--serve", str(socket_path), *warm_option])
-    except KeyboardInterrupt:
-        # asyncio has already cancelled the server, which stopped the machine on its way out.
-        print(f"chronobox: {config.path} stopped", file=sys.stderr)
+    # Held while the machine is up: a second `up` of the project stops here, even while the
+    # first is still booting (before its socket answers).
+    with socket_path.with_suffix(".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ServiceError(f"{config.path} is already up") from None
+        os.environ["CHRONOBOX_VM_DIR"] = str(args.vm_dir)
+        warm_option = ["--no-warm"] if args.no_warm else []
+        try:
+            server.main(["--project", str(config.file), "--serve", str(socket_path), *warm_option])
+        except KeyboardInterrupt:
+            # asyncio has already cancelled the server, which stopped the machine on its way out.
+            print(f"chronobox: {config.path} stopped", file=sys.stderr)
 
 
 def down(args: argparse.Namespace) -> None:

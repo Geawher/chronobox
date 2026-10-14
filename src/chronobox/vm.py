@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import errno
+import fcntl
 import itertools
 import json
 import os
@@ -27,6 +28,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TextIO
 
 from chronobox.images import DEFAULT_IMAGE, IMAGE_NAME, TOOLS_DISK, image_disk
 
@@ -40,6 +42,7 @@ LINK_REFUSED = (errno.EXDEV, errno.EPERM, errno.EACCES)
 SHARED_DISKS = (TOOLS_DISK, IMAGE_LINK)
 DATA_DISK = "data.ext4"
 SPEC_FILE = "spec.json"
+IN_USE_LOCK = "in-use.lock"
 # (drive id, file in the VM's directory, root device, read-only): the guest sees them as vda, vdb
 # and vdc in this order, which the tools drive's init relies on.
 DRIVES = (
@@ -249,7 +252,7 @@ class FirecrackerBackend:
         self._stores: dict[str, Path] = {}
         # Saved machines this backend restores from but does not own (warm starts): never
         # deleted, and old enough that their clock needs setting.
-        self._borrowed: set[str] = set()
+        self._borrowed: dict[str, TextIO] = {}  # snapshot key -> its in-use lock
         self._live: set[Machine] = set()
 
     async def start(self, spec: MachineSpec) -> Machine:
@@ -299,12 +302,29 @@ class FirecrackerBackend:
 
     def borrow(self, directory: Path) -> Snapshot:
         """Use a ``save``d machine as a snapshot of this backend, without owning it: ``release``
-        leaves it in place, and machines restored from it get the host's clock."""
-        fields = json.loads((directory / SPEC_FILE).read_text())
+        leaves it in place, and machines restored from it get the host's clock.
+
+        Until ``release`` or ``cleanup``, a shared lock on the directory tells whoever prunes
+        saved machines (``try_lock_saved``) that it is in use.
+
+        Raises:
+            VMError: If the directory does not hold a saved machine.
+        """
+        try:
+            lock = (directory / IN_USE_LOCK).open("a")
+        except OSError as error:
+            raise VMError(f"no saved machine in {directory}: {error}") from error
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        try:
+            fields = json.loads((directory / SPEC_FILE).read_text())
+            spec = MachineSpec(**{**fields, "setup": tuple(fields["setup"])})
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            lock.close()
+            raise VMError(f"no usable saved machine in {directory}: {error!r}") from error
         key = str(next(self._ids))
-        self._specs[key] = MachineSpec(**{**fields, "setup": tuple(fields["setup"])})
+        self._specs[key] = spec
         self._stores[key] = directory
-        self._borrowed.add(key)
+        self._borrowed[key] = lock
         return Snapshot(key)
 
     async def _snapshot_into(self, machine: Machine, store: Path) -> None:
@@ -343,7 +363,7 @@ class FirecrackerBackend:
         self._specs.pop(snapshot.key, None)
         store = self._stores.pop(snapshot.key, None)
         if snapshot.key in self._borrowed:
-            self._borrowed.discard(snapshot.key)
+            self._borrowed.pop(snapshot.key).close()
         elif store is not None:
             shutil.rmtree(store, ignore_errors=True)
 
@@ -354,6 +374,9 @@ class FirecrackerBackend:
         """Stop every machine and delete this backend's VMs and snapshots."""
         for machine in list(self._live):
             await self._close(machine)
+        for lock in self._borrowed.values():
+            lock.close()
+        self._borrowed.clear()
         shutil.rmtree(self.root, ignore_errors=True)
 
     async def _close(self, machine: Machine) -> None:
@@ -451,6 +474,18 @@ def _raise_for(reply: dict[str, object], action: str) -> None:
 def _die_with_parent() -> None:
     """Make the kernel kill the VM if the process that launched it dies, even by SIGKILL."""
     ctypes.CDLL(None).prctl(_PR_SET_PDEATHSIG, _SIGKILL)
+
+
+def try_lock_saved(directory: Path) -> TextIO | None:
+    """An exclusive lock on a ``save``d machine, or ``None`` while a backend borrows it. Hold
+    it while deleting the directory, so no backend starts borrowing it meanwhile."""
+    lock = (directory / IN_USE_LOCK).open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        return None
+    return lock
 
 
 def _link_disk(disk: Path, link: Path) -> None:

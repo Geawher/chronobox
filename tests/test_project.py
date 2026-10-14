@@ -1,9 +1,11 @@
 """Project files, warm-start keys, service commands and patches (no VM)."""
 
+import fcntl
 import io
 import os
 import subprocess
 import tarfile
+import time
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -11,8 +13,12 @@ import pytest
 from chronobox.config import Service, load_config
 from chronobox.images import TOOLS_DISK, image_disk
 from chronobox.project import (
+    PARTIAL_SUFFIX,
+    ProjectError,
+    _export_destination,
     _git_diff,
     _project_paths,
+    _prune_warm,
     is_excluded,
     pack_project,
     project_entries,
@@ -39,7 +45,8 @@ def vm_dir(tmp_path: Path) -> Path:
     vm = tmp_path / "vm"
     image_disk(vm, "default").parent.mkdir(parents=True)
     image_disk(vm, "default").write_bytes(b"image")
-    (vm / TOOLS_DISK).write_bytes(b"tools")
+    for name in ("firecracker", "vmlinux", TOOLS_DISK):
+        (vm / name).write_bytes(name.encode())
     return vm
 
 
@@ -82,10 +89,11 @@ def test_warm_key_follows_project_files_but_not_excluded_ones(project: Path, vm_
     assert warm_key(config, vm_dir) != first
 
 
-def test_warm_key_follows_the_image_and_the_tools_drive(project: Path, vm_dir: Path) -> None:
+@pytest.mark.parametrize("vm_file", ["firecracker", "vmlinux", TOOLS_DISK, "images/default/rootfs.ext4"])
+def test_warm_key_follows_every_vm_file(project: Path, vm_dir: Path, vm_file: str) -> None:
     config = load_config(project)
     first = warm_key(config, vm_dir)
-    os.utime(vm_dir / TOOLS_DISK, ns=(0, 1))
+    os.utime(vm_dir / vm_file, ns=(0, 1))
     assert warm_key(config, vm_dir) != first
 
 
@@ -118,6 +126,47 @@ def test_a_service_without_restart_runs_once() -> None:
 )
 def test_patches_name_project_paths_but_leave_content_alone(line: str, renamed: str) -> None:
     assert _project_paths(line) == renamed
+
+
+@pytest.mark.parametrize("path", ["/../../etc", "/src/../../x", "src/app.py", "../x"])
+def test_export_refuses_paths_that_would_leave_the_exports_folder(tmp_path: Path, path: str) -> None:
+    with pytest.raises(ProjectError):
+        _export_destination(tmp_path / "exports" / "main", path)
+
+
+def test_export_places_machine_paths_under_the_exports_folder(tmp_path: Path) -> None:
+    exports = tmp_path / "exports" / "main"
+    assert _export_destination(exports, "/src/app.py") == exports / "src" / "app.py"
+
+
+def test_a_patch_with_binary_files_odd_names_and_links_applies_with_git(tmp_path: Path) -> None:
+    host, machine = tmp_path / "host", tmp_path / "machine"
+    for side in (host, machine):
+        (side / "my host").mkdir(parents=True)
+        (side / "café.txt").write_text("v1\n")
+    (machine / "café.txt").write_text("v2\n")
+    (machine / "my host" / "f.txt").write_text("spaces\n")
+    (machine / "logo.bin").write_bytes(bytes(range(256)))
+    (machine / "python").symlink_to("/usr/bin/python3")
+    patch = _git_diff(tmp_path)
+    subprocess.run(["git", "apply", "-"], cwd=host, input=patch, text=True, check=True)
+    assert (host / "café.txt").read_text() == "v2\n"
+    assert (host / "my host" / "f.txt").read_text() == "spaces\n"
+    assert (host / "logo.bin").read_bytes() == bytes(range(256))
+    assert os.readlink(host / "python") == "/usr/bin/python3"
+
+
+def test_pruning_keeps_warm_starts_in_use_and_fresh_partial_ones(tmp_path: Path) -> None:
+    project = tmp_path / "warm" / "project"
+    keep, unused, in_use = project / "new", project / "old", project / "older"
+    fresh_partial, stale_partial = project / f"a{PARTIAL_SUFFIX}", project / f"b{PARTIAL_SUFFIX}"
+    for folder in (keep, unused, in_use, fresh_partial, stale_partial):
+        folder.mkdir(parents=True)
+    os.utime(stale_partial, (time.time() - 7200, time.time() - 7200))
+    with (in_use / "in-use.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)  # what a session borrowing it holds
+        _prune_warm(keep)
+    assert sorted(entry.name for entry in project.iterdir()) == sorted(["new", "older", fresh_partial.name])
 
 
 def test_a_patch_with_added_changed_and_deleted_files_applies_with_git(tmp_path: Path) -> None:

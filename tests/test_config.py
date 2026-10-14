@@ -71,6 +71,10 @@ ready_timeout = 30
         ("[project]\ntarget = 'src'\n", "absolute"),
         ("setup = 'make'\n", "setup must be a list of str"),
         ("image = [", "chronobox.toml"),
+        ("image = '../x'\n", "bad image name"),
+        ("[[service]]\nname = 'web api'\nstart = 'x'\n", "service name"),
+        ("[[service]]\nname = 'a;rm'\nstart = 'x'\n", "service name"),
+        ("[[service]]\nname = 'a'\nstart = 'x'\nenv = { 'A B' = 'x' }\n", "bad env variable names"),
     ],
 )
 def test_mistakes_are_reported_clearly(tmp_path: Path, text: str, message: str) -> None:

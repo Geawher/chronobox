@@ -4,10 +4,11 @@ A fresh boot copies the project into the machine, runs ``prepare``, starts the s
 (each kept running by a small restart loop, logged to ``/var/log/chronobox/<name>.log``)
 and waits until each is ready, then runs ``setup``. The prepared machine is saved as a
 **warm snapshot**, keyed by the config, the project's files and the VM disks; while none of
-them changes, later sessions restore it in about a second instead of preparing again.
+them changes, later sessions restore it in about 0.1 s instead of preparing again.
 
-Getting work out: ``project_diff`` is a patch of the project as the machine has it against
-the host's copy; ``export`` copies a path from the machine into ``.chronobox/exports``.
+Getting work out: ``project_diff`` is a patch from the project as it was copied in (kept
+with the machine) to the project as the machine has it now; ``export`` copies a path from
+the machine into ``.chronobox/exports``.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import asyncio
 import fnmatch
 import hashlib
 import io
+import logging
 import os
 import re
 import shlex
@@ -31,8 +33,10 @@ from pathlib import Path, PurePosixPath
 from chronobox.config import ProjectConfig, Service
 from chronobox.images import TOOLS_DISK, image_disk
 from chronobox.service import Method
-from chronobox.vm import FirecrackerBackend, Machine, MachineSpec, VMError
+from chronobox.vm import FirecrackerBackend, Machine, MachineSpec, VMError, try_lock_saved
 from chronobox.workspace import MAIN, Booted, Workspace
+
+log = logging.getLogger(__name__)
 
 LOG_DIR = "/var/log/chronobox"
 SERVICES_DIR = "/var/lib/chronobox/services"
@@ -43,10 +47,27 @@ RESTART_DELAY_S = 1
 LOG_TAIL_LINES = 30
 WARM_COMPLETE = "complete"
 PARTIAL_SUFFIX = ".partial"
+STALE_PARTIAL_S = 3600  # a half-written warm snapshot this old was left by a crash
+# Bump when what a prepared machine holds changes (e.g. how services are started), so warm
+# snapshots made by older code are not reused.
+WARM_FORMAT = "2"
+BASELINE = "project.tar"  # the project as it was copied in: what diffs compare against
 NO_DIFFERENCES = 0
 DIFFERENCES = 1
-SIDE_FOLDER = re.compile(r"(?<=\s)(a/|b/)?(?:host|machine)/")
+DIFF_COMMAND = (
+    "git", "-c", "core.quotepath=off", "diff", "--no-index", "--no-ext-diff", "--no-color",
+    "--binary", "--src-prefix=a/", "--dst-prefix=b/", "host", "machine",
+)  # fmt: skip
+# Header lines name files by the scratch folder they are in: a/host/..., b/machine/..., or
+# (added or deleted files, renames) the same folder on both sides.
+SIDE_FOLDER = re.compile(r'(?<=[\s"])([ab]/)(?:host|machine)/')
+RENAME_FOLDER = re.compile(r"^(rename (?:from|to) )(?:host|machine)/")
 DIFF_HEADERS = ("diff --git ", "--- ", "+++ ", "rename from ", "rename to ", "Binary files ")
+SPECIAL_FILES = (tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.FIFOTYPE)
+
+
+class ProjectError(Exception):
+    """A diff or export that cannot be done as asked; the message is for the agent."""
 
 
 def cache_dir() -> Path:
@@ -124,14 +145,16 @@ def pack_project(config: ProjectConfig) -> bytes:
 
 def warm_key(config: ProjectConfig, vm_dir: Path) -> str:
     """Changes whenever the config, a project file (by size and modification time) or a VM
-    disk changes, so a warm snapshot is only reused for the same starting point."""
-    digest = hashlib.sha256(config.file.read_bytes())
+    file changes (Firecracker, kernel, tools drive, image), or the warm format does, so a warm
+    snapshot is only reused for the same starting point and a VM that can load it."""
+    digest = hashlib.sha256(f"{WARM_FORMAT}\n".encode() + config.file.read_bytes())
     for relative in project_entries(config):
         stat = (config.path / relative).lstat()
         digest.update(f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
-    for disk in (vm_dir / TOOLS_DISK, image_disk(vm_dir, config.image.name)):
-        stat = disk.stat()
-        digest.update(f"{disk}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
+    vm_files = (vm_dir / "firecracker", vm_dir / "vmlinux", vm_dir / TOOLS_DISK)
+    for vm_file in (*vm_files, image_disk(vm_dir, config.image.name)):
+        stat = vm_file.stat()
+        digest.update(f"{vm_file}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
     return digest.hexdigest()[:24]
 
 
@@ -164,9 +187,9 @@ def service_command(service: Service, target: str) -> str:
 class ProjectBoot:
     """Starts a project's main machine: from its warm snapshot if one matches, else fresh.
 
-    A warm start's snapshot is also the workspace's start checkpoint. A newer warm snapshot of
-    the same project (after its files or config changed) replaces the older one, so a session
-    still running on the older one can no longer roll back to its start.
+    A warm start's snapshot is also the workspace's start checkpoint; while the session runs,
+    it holds that snapshot in use, so a newer warm snapshot of the project (after its files or
+    config changed) never deletes it.
 
     Args:
         backend: The backend the machine belongs to.
@@ -180,16 +203,38 @@ class ProjectBoot:
         self.warm_dir = warm_dir
         self.was_warm = False
         self.seconds = 0.0
+        self.baseline = backend.root / BASELINE
 
     async def __call__(self) -> Booted:
         started = time.monotonic()
         warm = self._warm_path()
-        if warm is not None and (warm / WARM_COMPLETE).exists():
+        booted = await self._from_warm(warm) if warm is not None else None
+        if booted is None:
+            booted = await self._fresh(warm)
+        self.seconds = time.monotonic() - started
+        return booted
+
+    async def _from_warm(self, warm: Path) -> Booted | None:
+        if not (warm / WARM_COMPLETE).exists():
+            return None
+        try:
             snapshot = self.backend.borrow(warm)
+        except VMError as error:  # deleted since, or broken: boot fresh
+            log.warning("not using warm start %s: %s", warm, error)
+            return None
+        try:
             machine = await self.backend.restore(snapshot)
-            self.was_warm = True
-            self.seconds = time.monotonic() - started
-            return Booted(machine, snapshot)
+        except (VMError, OSError) as error:
+            # A snapshot this VM cannot load would fail every session: drop it, boot fresh.
+            log.warning("warm start %s failed, booting fresh: %s", warm, error)
+            await self.backend.release(snapshot)
+            shutil.rmtree(warm, ignore_errors=True)
+            return None
+        self.was_warm = True
+        self.baseline = warm / BASELINE
+        return Booted(machine, snapshot)
+
+    async def _fresh(self, warm: Path | None) -> Booted:
         machine = await self.backend.start(machine_spec(self.config))
         try:
             await self._prepare(machine)
@@ -198,12 +243,13 @@ class ProjectBoot:
             raise
         if warm is not None:
             await self._save_warm(machine, warm)
-        self.seconds = time.monotonic() - started
         return Booted(machine)
 
     async def _prepare(self, machine: Machine) -> None:
         config = self.config
-        await machine.put(config.target, await asyncio.to_thread(pack_project, config))
+        archive = await asyncio.to_thread(pack_project, config)
+        self.baseline.write_bytes(archive)
+        await machine.put(config.target, archive)
         await _check(machine, f"cd {shlex.quote(config.target)}", "enter the project")
         for command in config.prepare:
             await _check(machine, command, "prepare")
@@ -220,30 +266,66 @@ class ProjectBoot:
         return self.warm_dir / project_id(self.config) / warm_key(self.config, self.backend.vm_dir)
 
     async def _save_warm(self, machine: Machine, warm: Path) -> None:
-        # Write next to the final place, then rename: a crash never leaves a half snapshot
-        # that looks complete. Older snapshots of the project are dropped.
-        partial = warm.with_name(warm.name + PARTIAL_SUFFIX)
-        shutil.rmtree(partial, ignore_errors=True)
-        await self.backend.save(machine, partial)
-        (partial / WARM_COMPLETE).touch()
-        for old in warm.parent.iterdir():
-            if old != partial:
-                shutil.rmtree(old, ignore_errors=True)
-        partial.rename(warm)
+        """Save the prepared machine for later sessions; a failure only costs them the warm start.
+
+        Each session writes its own partial folder and renames it into place, so a crash never
+        leaves a half snapshot that looks complete and concurrent sessions never mix files.
+        """
+        partial = warm.with_name(f"{warm.name}.{uuid.uuid4().hex[:8]}{PARTIAL_SUFFIX}")
+        try:
+            await self.backend.save(machine, partial)
+            shutil.copyfile(self.baseline, partial / BASELINE)
+            (partial / WARM_COMPLETE).touch()
+            partial.rename(warm)
+        except (OSError, VMError) as error:
+            # Includes another session having saved the same key first: theirs is as good.
+            shutil.rmtree(partial, ignore_errors=True)
+            if not (warm / WARM_COMPLETE).exists():
+                log.warning("could not save the warm start %s: %s", warm, error)
+            return
+        _prune_warm(warm)
 
 
-async def project_diff(machine: Machine, config: ProjectConfig) -> str:
-    """A unified diff from the host's project to the project as the machine has it now.
+def _prune_warm(keep: Path) -> None:
+    """Delete the project's other warm snapshots, except those a session still uses and
+    partial ones another session may still be writing."""
+    for entry in keep.parent.iterdir():
+        if entry == keep:
+            continue
+        try:
+            _prune_one(entry)
+        except OSError as error:  # e.g. another session deleted it first
+            log.warning("could not prune warm start %s: %s", entry, error)
+
+
+def _prune_one(entry: Path) -> None:
+    if entry.name.endswith(PARTIAL_SUFFIX):
+        if time.time() - entry.stat().st_mtime > STALE_PARTIAL_S:
+            shutil.rmtree(entry, ignore_errors=True)
+        return
+    lock = try_lock_saved(entry)
+    if lock is None:
+        return
+    with lock:
+        shutil.rmtree(entry, ignore_errors=True)
+
+
+async def project_diff(machine: Machine, config: ProjectConfig, baseline: bytes) -> str:
+    """A patch from the project as it was copied in (``baseline``, a ``pack_project`` archive)
+    to the project as the machine has it now; ``git apply`` in the local copy applies it.
+
+    Comparing with what was copied in, not with the local files, keeps edits made locally
+    since then out of the patch.
 
     Raises:
         VMError: If the project folder cannot be read in the machine.
-        RuntimeError: If ``git`` (used for the diff) is missing on the host.
+        ProjectError: If ``git`` (used for the diff) is missing or fails on the host.
     """
     archive = await machine.get(config.target, exclude=config.exclude)
     with tempfile.TemporaryDirectory(prefix="chronobox-diff-") as work_dir:
         work = Path(work_dir)
-        _unpack(archive, work / "machine")
-        _unpack(await asyncio.to_thread(pack_project, config), work / "host")
+        _unpack_for_diff(archive, work / "machine")
+        _unpack_for_diff(baseline, work / "host")
         return await asyncio.to_thread(_git_diff, work)
 
 
@@ -251,33 +333,54 @@ async def export(machine: Machine, config: ProjectConfig, path: str, where: str)
     """Copy ``path`` from the machine into ``<project>/.chronobox/exports/<where>/``.
 
     Raises:
+        ProjectError: If ``path`` is not absolute or climbs with ``..``.
         VMError: If the path does not exist in the machine.
     """
+    exports = config.path / EXPORTS_DIR / where
+    destination = _export_destination(exports, path)
     archive = await machine.get(path)
-    destination = config.path / EXPORTS_DIR / where / path.strip("/")
-    if destination.is_dir():
+    if destination.is_dir() and not destination.is_symlink():
         shutil.rmtree(destination)
-    elif destination.exists():
+    elif destination.is_symlink() or destination.exists():
         destination.unlink()
     # A file comes under its own name, so it goes into its parent folder.
     _unpack(archive, destination if _holds_a_folder(archive) else destination.parent)
     return destination
 
 
-def project_tools(workspace: Workspace, config: ProjectConfig) -> dict[str, Method]:
+def _export_destination(exports: Path, path: str) -> Path:
+    """Where ``path`` of the machine goes under ``exports``; it must stay there, since what is
+    there is deleted first.
+
+    Raises:
+        ProjectError: If ``path`` is not absolute, climbs with ``..``, or leaves ``exports``.
+    """
+    machine_path = PurePosixPath(path)
+    if not machine_path.is_absolute() or ".." in machine_path.parts:
+        raise ProjectError(f"export needs an absolute path without '..' in the machine, not {path!r}")
+    destination = exports.joinpath(*machine_path.parts[1:])
+    root = exports.resolve()
+    if destination != exports and not destination.parent.resolve().is_relative_to(root):
+        raise ProjectError(f"{path!r} would be exported outside {exports}")
+    return destination
+
+
+def project_tools(workspace: Workspace, boot: ProjectBoot) -> dict[str, Method]:
     """The project's tool methods (``diff``, ``export``), for ``WorkspaceService.extra_methods``."""
+    config = boot.config
 
     async def diff(where: str = MAIN) -> str:
         try:
-            patch = await project_diff(workspace.machine(where), config)
-        except (VMError, RuntimeError) as error:
+            baseline = await asyncio.to_thread(boot.baseline.read_bytes)
+            patch = await project_diff(workspace.machine(where), config, baseline)
+        except (VMError, ProjectError, tarfile.TarError, OSError) as error:
             return f"error: {error}"
-        return patch or f"no changes: {config.target} on {where} matches the local project"
+        return patch or f"no changes: {config.target} on {where} matches the project as copied in"
 
     async def export_path(path: str, where: str = MAIN) -> str:
         try:
             destination = await export(workspace.machine(where), config, path, where)
-        except VMError as error:
+        except (VMError, ProjectError, tarfile.TarError, OSError) as error:
             return f"error: {error}"
         return f"copied {path} from {where} to {destination}"
 
@@ -290,8 +393,8 @@ def project_note(config: ProjectConfig) -> str:
     return (
         f"The project {config.path.name} is copied at {config.target} in the machine (commands start "
         f"there). Its services ({services}) are running, restarted if they exit; logs in {LOG_DIR}. "
-        "`diff` shows what changed in the project on the main machine or a fork, as a patch for the "
-        "local copy; `export` copies files out of the machine."
+        "`diff` shows what changed in the project on the main machine or a fork since it was copied "
+        "in, as a patch for the local copy; `export` copies files out of the machine."
     )
 
 
@@ -317,9 +420,25 @@ async def _wait_ready(machine: Machine, service: Service) -> None:
 
 
 def _unpack(archive: bytes, destination: Path) -> None:
+    """Unpack an archive from the machine into the project: nothing may land outside
+    ``destination`` or link out of it (tar's ``data`` filter)."""
     destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(destination, filter="data")
+
+
+def _unpack_for_diff(archive: bytes, destination: Path) -> None:
+    """Unpack into a private scratch folder for git to compare: links are kept as they are (an
+    absolute one, e.g. in a virtualenv, is a change like any other), special files skipped."""
+    destination.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        tar.extractall(destination, filter=_keep_links_skip_special)
+
+
+def _keep_links_skip_special(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo | None:
+    if member.type in SPECIAL_FILES:
+        return None
+    return tarfile.tar_filter(member, destination)
 
 
 def _holds_a_folder(archive: bytes) -> bool:
@@ -328,22 +447,21 @@ def _holds_a_folder(archive: bytes) -> bool:
 
 
 def _git_diff(work: Path) -> str:
+    """The patch from ``work/host`` to ``work/machine``, named by project paths.
+
+    Raises:
+        ProjectError: If git is missing or fails.
+    """
     if shutil.which("git") is None:
-        raise RuntimeError("git is needed on the host for diffs")
-    done = subprocess.run(
-        ["git", "diff", "--no-index", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "host", "machine"],
-        cwd=work,
-        capture_output=True,
-        text=True,
-    )
+        raise ProjectError("git is needed on the host for diffs")
+    done = subprocess.run(DIFF_COMMAND, cwd=work, capture_output=True, text=True)
     if done.returncode not in (NO_DIFFERENCES, DIFFERENCES):
-        raise RuntimeError(f"git diff failed: {done.stderr.strip()}")
+        raise ProjectError(f"git diff failed: {done.stderr.strip()}")
     return "".join(_project_paths(line) for line in done.stdout.splitlines(keepends=True))
 
 
 def _project_paths(line: str) -> str:
-    """git names files by the folder they are in (``a/host/x``, ``b/machine/x``, and for an added
-    or deleted file the same folder on both sides); name them by project path instead."""
+    """Name files in header lines by their project path instead of the scratch folder."""
     if not line.startswith(DIFF_HEADERS):
         return line
-    return SIDE_FOLDER.sub(r"\1", line)
+    return RENAME_FOLDER.sub(r"\1", SIDE_FOLDER.sub(r"\1", line))

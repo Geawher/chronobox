@@ -195,18 +195,22 @@ async def run_serving(args: argparse.Namespace) -> None:
         try:
             if args.project:
                 await service.ready.wait()
-                print(_up_message(args, service), file=sys.stderr, flush=True)
+                print(_up_message(args.project, service), file=sys.stderr, flush=True)
+                if service.error:
+                    # Agents would connect to it and get only errors; better none is up.
+                    raise SystemExit(1)
             await service.stopped.wait()
         finally:
             args.serve.unlink(missing_ok=True)
 
 
-def _up_message(args: argparse.Namespace, service: WorkspaceService) -> str:
+def _up_message(project: Path, service: WorkspaceService) -> str:
     if service.error:
         return f"chronobox: the machine failed to start: {service.error}"
+    folder = load_config(project).path
     return (
-        f"chronobox: {args.project} is up. Agents started with `chronobox mcp --project` use this "
-        "machine; `chronobox cp` copies files in and out; Ctrl-C or `chronobox down` stops it."
+        f"chronobox: {folder} is up. Agents started with `chronobox mcp --project` use this machine; "
+        "`chronobox cp` copies files in and out; Ctrl-C or `chronobox down` stops it."
     )
 
 
@@ -234,18 +238,18 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
     backend = FirecrackerBackend(args.root or (session_root() if project else None))
     if project is None:
         workspace = Workspace(backend, machine_spec(args), profile=args.profile, guard=args.guard)
+        service = WorkspaceService(workspace)
     else:
         boot = ProjectBoot(backend, project, None if args.no_warm else default_warm_dir())
         spec = project_machine_spec(project)
         workspace = Workspace(backend, spec, profile=args.profile, guard=args.guard, boot=boot)
-    service = WorkspaceService(workspace)
-    if project is not None:
-        service.extra_methods.update(project_tools(workspace, project))
-    boot = asyncio.create_task(service.boot())
+        service = WorkspaceService(workspace)
+        service.extra_methods.update(project_tools(workspace, boot))
+    booting = asyncio.create_task(service.boot())
     try:
         yield service
     finally:
-        boot.cancel()
+        booting.cancel()
         await workspace.close()
         await backend.cleanup()
 

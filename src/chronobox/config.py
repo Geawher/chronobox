@@ -29,12 +29,13 @@ install belongs in the image.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from chronobox.images import DEFAULT_IMAGE, image_name
+from chronobox.images import DEFAULT_IMAGE, ImageError, check_image_name, image_name
 
 CONFIG_FILE = "chronobox.toml"
 DEFAULT_TARGET = "/src"
@@ -45,6 +46,9 @@ MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
 PROJECT_KEYS = frozenset({"path", "target", "exclude"})
 IMAGE_KEYS = frozenset({"name", "reference", "dockerfile", "context"})
 SERVICE_KEYS = frozenset({"name", "start", "ready", "env", "workdir", "restart", "ready_timeout"})
+# Service names become file names in commands, so keep them to what needs no quoting.
+SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class ConfigError(ValueError):
@@ -170,6 +174,15 @@ def load_config(project: Path) -> ProjectConfig:
 
 
 def _image(value: Any, base: Path) -> ImageSource:
+    source = _image_source(value, base)
+    try:
+        check_image_name(source.name)
+    except ImageError as error:
+        raise ConfigError(f"image: {error}") from error
+    return source
+
+
+def _image_source(value: Any, base: Path) -> ImageSource:
     if isinstance(value, str):
         return ImageSource(name=value)
     if not isinstance(value, dict):
@@ -190,9 +203,14 @@ def _service(entry: dict[str, Any]) -> Service:
     _check_keys(entry, SERVICE_KEYS, "service")
     if not entry.get("name") or not entry.get("start"):
         raise ConfigError(f"every service needs a name and a start command: {entry}")
+    if not SERVICE_NAME.fullmatch(str(entry["name"])):
+        raise ConfigError(f"service name {entry['name']!r}: use letters, digits, '.', '_' and '-'")
     env = entry.get("env", {})
     if not all(isinstance(value, str) for value in env.values()):
         raise ConfigError(f"service {entry['name']}: env values must be strings")
+    bad_names = [name for name in env if not ENV_NAME.fullmatch(name)]
+    if bad_names:
+        raise ConfigError(f"service {entry['name']}: bad env variable names {bad_names}")
     return Service(
         name=entry["name"],
         start=entry["start"],
