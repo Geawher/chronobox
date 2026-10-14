@@ -119,19 +119,36 @@ env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 ```
 
 ```bash
-uv run chronobox build --project path/to/app       # the image it declares, once
-claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp --project path/to/app
+cd path/to/app
+chronobox build --project .        # the image it declares, once
+chronobox warm                     # optional: prepare the warm start now, not in the first session
+claude mcp add chronobox -- chronobox mcp --project .
 ```
+
+(`chronobox` here is the installed command; from a checkout, use
+`uv run --project /path/to/chronobox chronobox`.)
 
 - The project is copied to `/src` (`[project] target`), where commands start.
 - Services run under a small restart loop, logs in `/var/log/chronobox/<name>.log`.
 - **Warm start**: the first session prepares the machine and saves it
-  (`~/.cache/chronobox/warm`); later sessions restore it in about a second, as long as the
+  (`~/.cache/chronobox/warm`); later sessions restore it in about 0.1 s, as long as the
   config, the project's files and the image are unchanged (`--no-warm` to boot fresh). The
   saved machine is also the session's `start` checkpoint.
 - Two more tools: `diff(where)` (what changed in the project on main or a fork, as a patch
-  for your local copy) and `export(path, where)` (copy files out to `.chronobox/exports/`).
+  for your local copy: `git apply` takes it) and `export(path, where)` (copy files out to
+  `.chronobox/exports/`).
 - Machines have no network: install everything in the image.
+
+To work on the same machine as the agent, keep it running yourself:
+
+```bash
+chronobox up                                    # in the project; Ctrl-C or `chronobox down` stops it
+chronobox cp ./fixtures main:/src/fixtures      # in: a folder's content, or a file, into a folder
+chronobox cp main:/src/report.csv ./out         # out (a fork works too: try-1:/src/...)
+```
+
+While `chronobox up` runs, `chronobox mcp --project .` (so every agent session) works on that
+machine instead of starting its own, and keeps it when the session ends.
 
 Options: `--project DIR`, `--no-warm`, `--image NAME` (default `default`),
 `--profile alone|rollback|chronobox` (default `chronobox`), `--guard`,
@@ -199,8 +216,9 @@ lazily; checkpoints are files on disk.
 ```
 src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints, forks,
                  reports, lessons, guard) · commands.py · service.py · server.py (MCP)
-                 images.py · cli.py (`chronobox build` / `images`) · config.py (chronobox.toml)
-                 project.py (bring a project up, warm start, diff, export)
+                 images.py · cli.py (`chronobox build`, `images`, `warm`, `up`, `cp`, `down`, `mcp`)
+                 config.py (chronobox.toml) · project.py (bring a project up, warm start, diff,
+                 export) · copying.py (`chronobox cp`)
 vm/              tools/ (tools drive: init, guest agent) · images/default/ · fetch.sh · build_rootfs.sh
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
 examples/notes/  a web app + PostgreSQL project with its chronobox.toml

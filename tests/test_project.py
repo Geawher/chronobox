@@ -2,6 +2,7 @@
 
 import io
 import os
+import subprocess
 import tarfile
 from pathlib import Path, PurePosixPath
 
@@ -10,6 +11,7 @@ import pytest
 from chronobox.config import Service, load_config
 from chronobox.images import TOOLS_DISK, image_disk
 from chronobox.project import (
+    _git_diff,
     _project_paths,
     is_excluded,
     pack_project,
@@ -101,8 +103,34 @@ def test_a_service_without_restart_runs_once() -> None:
     assert "while" not in command and "cd /opt" in command
 
 
-def test_patches_name_project_paths_but_leave_content_alone() -> None:
-    assert _project_paths("diff --git a/host/app.py b/machine/app.py\n") == "diff --git a/app.py b/app.py\n"
-    assert _project_paths("--- a/host/app.py\n") == "--- a/app.py\n"
-    assert _project_paths("+++ b/machine/app.py\n") == "+++ b/app.py\n"
-    assert _project_paths("+ path = 'a/host/x'\n") == "+ path = 'a/host/x'\n"
+@pytest.mark.parametrize(
+    ("line", "renamed"),
+    [
+        ("diff --git a/host/app.py b/machine/app.py\n", "diff --git a/app.py b/app.py\n"),
+        ("diff --git a/machine/new.py b/machine/new.py\n", "diff --git a/new.py b/new.py\n"),
+        ("diff --git a/host/old.py b/host/old.py\n", "diff --git a/old.py b/old.py\n"),
+        ("--- a/host/app.py\n", "--- a/app.py\n"),
+        ("+++ b/machine/app.py\n", "+++ b/app.py\n"),
+        ("+++ b/machine/host/x.py\n", "+++ b/host/x.py\n"),
+        ("Binary files a/host/x.png and b/machine/x.png differ", "Binary files a/x.png and b/x.png differ"),
+        ("+ path = 'a/host/x'\n", "+ path = 'a/host/x'\n"),
+    ],
+)
+def test_patches_name_project_paths_but_leave_content_alone(line: str, renamed: str) -> None:
+    assert _project_paths(line) == renamed
+
+
+def test_a_patch_with_added_changed_and_deleted_files_applies_with_git(tmp_path: Path) -> None:
+    host, machine = tmp_path / "host", tmp_path / "machine"
+    for side in (host, machine):
+        (side / "lib").mkdir(parents=True)
+        (side / "keep.py").write_text("x = 1\n")
+    (host / "old.py").write_text("gone\n")
+    (host / "lib" / "util.py").write_text("a = 1\n")
+    (machine / "lib" / "util.py").write_text("a = 2\n")
+    (machine / "lib" / "new.py").write_text("new\n")
+    patch = _git_diff(tmp_path)
+    subprocess.run(["git", "apply", "-"], cwd=host, input=patch, text=True, check=True)
+    assert not (host / "old.py").exists()
+    assert (host / "lib" / "util.py").read_text() == "a = 2\n"
+    assert (host / "lib" / "new.py").read_text() == "new\n"

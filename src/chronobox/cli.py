@@ -1,25 +1,39 @@
-"""Build and list chronobox machine images.
+"""Build chronobox machine images, prepare projects and serve them to agents.
 
     chronobox build --tools                          # the tools drive, once
     chronobox build --image postgres:16              # any Docker image, as is
     chronobox build --dockerfile ./Dockerfile        # or one built from a Dockerfile
     chronobox build --project .                      # the image a chronobox.toml declares
     chronobox images                                 # what is built
+    chronobox warm                                   # boot the project here once, save its warm start
+    chronobox up                                     # keep the project's machine running
+    chronobox cp ./fixtures main:/src/fixtures       # copy into it (or out: main:/src/app.py ./out)
+    chronobox down                                   # stop it
+    chronobox mcp --project .                        # the MCP server (same options as chronobox-mcp)
 
-Then ``chronobox-mcp --image NAME`` serves a machine of that image.
+In a project: ``claude mcp add chronobox -- chronobox mcp --project .``. While ``chronobox
+up`` runs, that server works on the machine it keeps (so you and the agent share it);
+otherwise each agent session starts its own.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import os
 import sys
 from pathlib import Path
 
-from chronobox.config import ConfigError, ImageSource, load_config
+from chronobox import server
+from chronobox.config import ConfigError, ImageSource, ProjectConfig, load_config
+from chronobox.copying import CopyError, check_direction, pack_local, parse_location, unpack_local
 from chronobox.images import Image, ImageError, build_image, build_tools, list_images
-from chronobox.vm import default_vm_dir
+from chronobox.project import ProjectBoot, default_warm_dir, session_root, up_socket
+from chronobox.service import Op, ServiceError, get_remote, is_serving, put_remote, request
+from chronobox.vm import FirecrackerBackend, VMError, default_vm_dir
 
 MIB = 2**20
+MAX_SOCKET_PATH = 107  # bytes in sockaddr_un.sun_path, without the final NUL
 
 
 def build(args: argparse.Namespace) -> None:
@@ -70,6 +84,88 @@ def show_images(args: argparse.Namespace) -> None:
         print(f"{image.name:<{width}}  {image.size_bytes / MIB:>7.0f} MiB  {image.config.source}")
 
 
+def warm(args: argparse.Namespace) -> None:
+    config = load_config(args.project)
+    boot = asyncio.run(prepare_warm_start(config, args.vm_dir))
+    if boot.was_warm:
+        print(f"{config.file}: the warm start is up to date ({boot.seconds:.1f} s to start)")
+    else:
+        print(
+            f"{config.file}: booted, prepared and saved in {boot.seconds:.1f} s; "
+            "agent sessions now start warm"
+        )
+
+
+async def prepare_warm_start(config: ProjectConfig, vm_dir: Path) -> ProjectBoot:
+    """Start the project's machine once, so its warm start exists, then stop it.
+
+    Raises:
+        VMError: If the machine does not boot or a prepare, service or setup step fails.
+    """
+    backend = FirecrackerBackend(session_root(), vm_dir)
+    boot = ProjectBoot(backend, config, default_warm_dir())
+    try:
+        await boot()
+    finally:
+        await backend.cleanup()
+    return boot
+
+
+def up(args: argparse.Namespace) -> None:
+    config = load_config(args.project)
+    socket_path = up_socket(config)
+    if asyncio.run(is_serving(socket_path)):
+        raise ServiceError(f"{config.path} is already up")
+    if len(os.fsencode(socket_path)) > MAX_SOCKET_PATH:
+        raise ServiceError(f"socket path too long for a unix socket: {socket_path}; set XDG_RUNTIME_DIR")
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    os.environ["CHRONOBOX_VM_DIR"] = str(args.vm_dir)
+    warm_option = ["--no-warm"] if args.no_warm else []
+    try:
+        server.main(["--project", str(config.path), "--serve", str(socket_path), *warm_option])
+    except KeyboardInterrupt:
+        # asyncio has already cancelled the server, which stopped the machine on its way out.
+        print(f"chronobox: {config.path} stopped", file=sys.stderr)
+
+
+def down(args: argparse.Namespace) -> None:
+    config = load_config(args.project)
+    socket_path = asyncio.run(running_machine(config))
+    asyncio.run(request(socket_path, {"op": Op.SHUTDOWN}))
+    print(f"{config.path} is shutting down")
+
+
+def copy(args: argparse.Namespace) -> None:
+    source, destination = parse_location(args.source), parse_location(args.destination)
+    check_direction(source, destination)
+    socket_path = asyncio.run(running_machine(load_config(args.project)))
+    if destination.is_remote:
+        archive = pack_local(Path(source.path))
+        asyncio.run(put_remote(socket_path, destination.where, destination.path, archive))
+        print(f"copied {source.path} into {args.destination}")
+        return
+    archive = asyncio.run(get_remote(socket_path, source.where, source.path))
+    names = unpack_local(archive, Path(destination.path))
+    print(f"copied {args.source} into {destination.path}: {', '.join(names) or 'empty folder'}")
+
+
+async def running_machine(config: ProjectConfig) -> Path:
+    """The socket of the machine ``chronobox up`` keeps for this project.
+
+    Raises:
+        ServiceError: If none is running.
+    """
+    socket_path = up_socket(config)
+    if not await is_serving(socket_path):
+        raise ServiceError(f"no machine is up for {config.path}; start one with `chronobox up`")
+    return socket_path
+
+
+def serve_mcp(args: argparse.Namespace) -> None:
+    os.environ["CHRONOBOX_VM_DIR"] = str(args.vm_dir)
+    server.main(args.server_args)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="chronobox", description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -89,14 +185,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     images_parser = commands.add_parser("images", help="list built images")
     images_parser.set_defaults(handler=show_images)
-    return parser.parse_args(argv)
+
+    project_commands = {
+        "warm": ("boot a project once and save its warm start", warm),
+        "up": ("keep a project's machine running (Ctrl-C stops it)", up),
+        "down": ("stop the machine `chronobox up` keeps", down),
+        "cp": ("copy files between here and the machine `chronobox up` keeps", copy),
+    }
+    for name, (summary, handler) in project_commands.items():
+        command = commands.add_parser(name, help=summary)
+        command.add_argument("--project", type=Path, default=Path(), help="project folder (default: here)")
+        command.set_defaults(handler=handler)
+        if handler is up:
+            command.add_argument("--no-warm", action="store_true", help="boot fresh, ignore the warm start")
+        if handler is copy:
+            command.add_argument("source", help="local path, or main:/PATH or FORK:/PATH")
+            command.add_argument("destination", help="a folder: local, or main:/PATH or FORK:/PATH")
+
+    # Every option after `mcp` (--help too) belongs to the server, which parses them itself.
+    mcp_parser = commands.add_parser(
+        "mcp", help="serve a machine to an agent (`chronobox mcp --help` for options)", add_help=False
+    )
+    mcp_parser.set_defaults(handler=serve_mcp)
+    args, server_args = parser.parse_known_args(argv)
+    if server_args and args.handler is not serve_mcp:
+        parser.error(f"unrecognized arguments: {' '.join(server_args)}")
+    args.server_args = server_args
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     try:
         args.handler(args)
-    except (ImageError, ConfigError) as error:
+    except (ImageError, ConfigError, VMError, ServiceError, CopyError) as error:
         sys.exit(f"chronobox: {error}")
 
 

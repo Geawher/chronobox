@@ -17,12 +17,14 @@ import fnmatch
 import hashlib
 import io
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
@@ -43,13 +45,36 @@ WARM_COMPLETE = "complete"
 PARTIAL_SUFFIX = ".partial"
 NO_DIFFERENCES = 0
 DIFFERENCES = 1
+SIDE_FOLDER = re.compile(r"(?<=\s)(a/|b/)?(?:host|machine)/")
 DIFF_HEADERS = ("diff --git ", "--- ", "+++ ", "rename from ", "rename to ", "Binary files ")
 
 
+def cache_dir() -> Path:
+    """``$XDG_CACHE_HOME/chronobox`` (``~/.cache/chronobox``)."""
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "chronobox"
+
+
 def default_warm_dir() -> Path:
-    """``$XDG_CACHE_HOME/chronobox/warm`` (``~/.cache/chronobox/warm``)."""
-    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return cache_home / "chronobox" / "warm"
+    return cache_dir() / "warm"
+
+
+def session_root() -> Path:
+    """A new folder for one session's VMs and snapshots, outside the project (the backend
+    deletes it when it cleans up)."""
+    return cache_dir() / "sessions" / uuid.uuid4().hex[:10]
+
+
+def project_id(config: ProjectConfig) -> str:
+    """Names the project by where its chronobox.toml is (two copies of a repo are two projects)."""
+    return hashlib.sha256(str(config.file).encode()).hexdigest()[:16]
+
+
+def up_socket(config: ProjectConfig) -> Path:
+    """Where ``chronobox up`` serves the project's machine: ``$XDG_RUNTIME_DIR/chronobox``
+    (``/run/user/<uid>``, short and meant for sockets), else the cache folder."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    folder = Path(runtime) / "chronobox" if runtime else cache_dir() / "up"
+    return folder / f"{project_id(config)}.sock"
 
 
 def machine_spec(config: ProjectConfig) -> MachineSpec:
@@ -192,8 +217,7 @@ class ProjectBoot:
     def _warm_path(self) -> Path | None:
         if self.warm_dir is None:
             return None
-        project_id = hashlib.sha256(str(self.config.file).encode()).hexdigest()[:16]
-        return self.warm_dir / project_id / warm_key(self.config, self.backend.vm_dir)
+        return self.warm_dir / project_id(self.config) / warm_key(self.config, self.backend.vm_dir)
 
     async def _save_warm(self, machine: Machine, warm: Path) -> None:
         # Write next to the final place, then rename: a crash never leaves a half snapshot
@@ -318,7 +342,8 @@ def _git_diff(work: Path) -> str:
 
 
 def _project_paths(line: str) -> str:
-    """git names both sides by their folder (``a/host/x``, ``b/machine/x``); name project paths."""
+    """git names files by the folder they are in (``a/host/x``, ``b/machine/x``, and for an added
+    or deleted file the same folder on both sides); name them by project path instead."""
     if not line.startswith(DIFF_HEADERS):
         return line
-    return line.replace("a/host/", "a/").replace("b/machine/", "b/")
+    return SIDE_FOLDER.sub(r"\1", line)

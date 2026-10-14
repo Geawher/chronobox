@@ -5,16 +5,20 @@ and hands its changes back as a patch; files move in and out of an image without
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from pathlib import Path
+from subprocess import CompletedProcess
 
 import pytest
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.types import CallToolResult
 
 from chronobox.config import ProjectConfig, load_config
 from chronobox.images import image_disk
@@ -146,37 +150,47 @@ async def test_the_mcp_server_serves_a_project_with_diff_and_export(
         tools = {tool.name for tool in (await session.list_tools()).tools}
         assert {"diff", "export"} <= tools
         result = await session.call_tool("diff", {})
-        assert "no changes" in "".join(getattr(part, "text", "") for part in result.content)
+        assert "no changes" in text_of(result)
 
 
-POSTGRES = "postgres-16"
-POSTGRES_PROJECT = """
-image = "postgres-16"
-setup = ["psql -h 127.0.0.1 -U postgres -f seed.sql"]
-
-[[service]]
-name = "db"
-start = "docker-entrypoint.sh postgres"
-ready = "pg_isready -q -h 127.0.0.1 -U postgres"
-env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
-"""
+def text_of(result: CallToolResult) -> str:
+    return "".join(getattr(part, "text", "") for part in result.content)
 
 
-@pytest.mark.skipif(not image_disk(default_vm_dir(), POSTGRES).exists(), reason=f"image {POSTGRES} not built")
-async def test_a_project_on_the_postgres_image_starts_its_entrypoint_and_starts_warm(tmp_path: Path) -> None:
-    folder = tmp_path / "orders-db"
-    folder.mkdir()
-    (folder / "chronobox.toml").write_text(POSTGRES_PROJECT)
-    (folder / "seed.sql").write_text("create table orders (item text); insert into orders values ('kept');\n")
-    project = load_config(folder)
-    for session in ("first", "second"):
-        backend = FirecrackerBackend(tmp_path / f"vms-{session}")
-        try:
-            workspace, boot = await start(backend, project, tmp_path / "warm")
-            assert boot.was_warm is (session == "second")
-            assert (
-                await output(workspace, "psql -h 127.0.0.1 -U postgres -tAc 'select item from orders'")
-                == "kept"
-            )
-        finally:
-            await backend.cleanup()
+def chronobox(command: str, project: ProjectConfig, *args: str, env: dict[str, str]) -> CompletedProcess[str]:
+    argv = [sys.executable, "-m", "chronobox.cli", command, "--project", str(project.path), *args]
+    return subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
+
+
+async def test_up_shares_one_machine_between_cp_and_the_agent_until_down(
+    project: ProjectConfig, tmp_path: Path
+) -> None:
+    # Own cache and runtime folders, so the test sees exactly what up leaves behind.
+    cache = Path(tempfile.mkdtemp(prefix="cbx-"))
+    env = {**os.environ, "XDG_CACHE_HOME": str(cache), "XDG_RUNTIME_DIR": str(cache), "PYTHONUNBUFFERED": "1"}
+    up_command = [sys.executable, "-m", "chronobox.cli", "up", "--project", str(project.path)]
+    up = subprocess.Popen(up_command, env=env, stderr=subprocess.PIPE, text=True)
+    try:
+        assert "is up" in up.stderr.readline()
+        (tmp_path / "fixtures").mkdir()
+        (tmp_path / "fixtures" / "seed.txt").write_text("from the host")
+        copied_in = chronobox("cp", project, str(tmp_path / "fixtures"), "main:/src/fixtures", env=env)
+        assert copied_in.returncode == 0, copied_in.stderr
+        mcp_args = ["-m", "chronobox.cli", "mcp", "--project", str(project.path)]
+        params = StdioServerParameters(command=sys.executable, args=mcp_args, env=env)
+        async with stdio_client(params) as streams, ClientSession(*streams) as session:
+            await session.initialize()
+            command = "cp fixtures/seed.txt answer.txt; cat answer.txt"
+            seen = await session.call_tool("run", {"command": command})
+            assert "from the host" in text_of(seen)
+        copied_out = chronobox("cp", project, "main:/src/answer.txt", str(tmp_path / "out"), env=env)
+        assert copied_out.returncode == 0, copied_out.stderr
+        assert (tmp_path / "out" / "answer.txt").read_text() == "from the host"
+        assert chronobox("down", project, env=env).returncode == 0
+        assert up.wait(timeout=60) == 0
+        assert not list((cache / "chronobox").glob("*.sock"))
+        assert not list((cache / "chronobox" / "sessions").iterdir())
+        assert "no machine is up" in chronobox("cp", project, "main:/src", "out", env=env).stderr
+    finally:
+        up.kill()
+        shutil.rmtree(cache, ignore_errors=True)

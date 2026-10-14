@@ -7,6 +7,8 @@ Three ways to run it:
 
       claude mcp add chronobox -- uv run --project /path/to/chronobox chronobox-mcp
 
+  or, in a project with a ``chronobox.toml``, ``chronobox mcp --project .``;
+
 - ``--serve SOCKET``: owns the VM and serves it on a unix socket, with no MCP of its
   own, so the machine outlives any agent session (benchmarks, long jobs);
 - ``--connect SOCKET``: a thin MCP front end for a ``--serve`` process, over stdio or,
@@ -30,9 +32,16 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from chronobox.config import ConfigError, ProjectConfig, load_config
 from chronobox.images import DEFAULT_IMAGE
-from chronobox.project import ProjectBoot, default_warm_dir, project_note, project_tools
+from chronobox.project import (
+    ProjectBoot,
+    default_warm_dir,
+    project_note,
+    project_tools,
+    session_root,
+    up_socket,
+)
 from chronobox.project import machine_spec as project_machine_spec
-from chronobox.service import WorkspaceService, call_remote
+from chronobox.service import WorkspaceService, call_remote, is_serving
 from chronobox.vm import FirecrackerBackend, MachineSpec
 from chronobox.workspace import MAIN, Profile, Workspace
 
@@ -183,7 +192,22 @@ async def run_local(args: argparse.Namespace) -> None:
 async def run_serving(args: argparse.Namespace) -> None:
     async with _owned_service(args) as service:
         await service.serve(args.serve)
-        await service.stopped.wait()
+        try:
+            if args.project:
+                await service.ready.wait()
+                print(_up_message(args, service), file=sys.stderr, flush=True)
+            await service.stopped.wait()
+        finally:
+            args.serve.unlink(missing_ok=True)
+
+
+def _up_message(args: argparse.Namespace, service: WorkspaceService) -> str:
+    if service.error:
+        return f"chronobox: the machine failed to start: {service.error}"
+    return (
+        f"chronobox: {args.project} is up. Agents started with `chronobox mcp --project` use this "
+        "machine; `chronobox cp` copies files in and out; Ctrl-C or `chronobox down` stops it."
+    )
 
 
 async def run_connected(args: argparse.Namespace) -> None:
@@ -205,8 +229,9 @@ async def run_connected(args: argparse.Namespace) -> None:
 
 @contextlib.asynccontextmanager
 async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-def]
-    backend = FirecrackerBackend(args.root)
     project = load_project(args)
+    # A project's server runs from the project's folder: keep its VMs out of it.
+    backend = FirecrackerBackend(args.root or (session_root() if project else None))
     if project is None:
         workspace = Workspace(backend, machine_spec(args), profile=args.profile, guard=args.guard)
     else:
@@ -226,7 +251,7 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="chronobox-mcp", description=__doc__.splitlines()[0])
     parser.add_argument("--profile", type=Profile, choices=list(Profile), default=Profile.CHRONOBOX)
     parser.add_argument(
         "--guard", action="store_true", help="refuse unrehearsed destructive commands on main"
@@ -259,12 +284,17 @@ def _note(args: argparse.Namespace) -> str | None:
     return project_note(project) if project else None
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     try:
-        load_project(args)
+        project = load_project(args)
     except ConfigError as error:
         sys.exit(f"chronobox-mcp: {error}")
+    if project is not None and not (args.serve or args.connect):
+        # A machine `chronobox up` keeps running for this project is the one to work on.
+        socket_path = up_socket(project)
+        if asyncio.run(is_serving(socket_path)):
+            args.connect = socket_path
     if args.connect:
         asyncio.run(run_connected(args))
     elif args.serve:
