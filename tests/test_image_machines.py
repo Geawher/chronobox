@@ -8,12 +8,14 @@ Build the images first (each test is skipped otherwise):
     chronobox build --image ruby:3.3
 """
 
+import os
+import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
 
-from chronobox.images import image_disk
+from chronobox.images import DEFAULT_IMAGE, TOOLS_DISK, image_disk
 from chronobox.vm import FirecrackerBackend, MachineSpec, default_vm_dir
 from chronobox.workspace import MAIN, Profile, Workspace
 
@@ -101,6 +103,11 @@ async def test_alpine_image_without_bash_or_python_runs_commands_in_sh(backend: 
     await workspace.run("cd /srv && export GREETING=hello")
     assert await output(workspace, 'echo "$(pwd) $GREETING"') == "/srv hello"
     assert await output(workspace, "node --version") == "v" + await output(workspace, "echo $NODE_VERSION")
+    # sh prints a multi-line value over several lines: the saved state must still hold only
+    # exports, so nothing of this command runs again and later commands keep working.
+    await workspace.run("echo once >> /tmp/runs\nexport LINES_VAR='a\nb'")
+    state = await output(workspace, 'cat /tmp/runs; echo "$LINES_VAR" | wc -l; echo $GREETING')
+    assert state == "once\n2\nhello"
 
 
 @requires_image(NODE)
@@ -133,3 +140,32 @@ async def test_ruby_image_keeps_its_environment_and_rolls_back(backend: Firecrac
     await workspace.run("echo 'puts :after' > /root/app.rb")
     await workspace.rollback("app-v1")
     assert await output(workspace, "ruby /root/app.rb") == "before"
+
+
+async def test_a_rebuilt_image_does_not_change_the_disk_under_a_saved_machine(tmp_path: Path) -> None:
+    # VM files and machines of our own, on the filesystem of the real VM files: disks are kept
+    # by hard links, which only work there (elsewhere machines fall back to symlinks).
+    real = default_vm_dir()
+    vm_dir = real.parent / f".test-vm-{tmp_path.name}"
+    (vm_dir / "images" / "copy").mkdir(parents=True)
+    try:
+        for name in ("firecracker", "vmlinux", TOOLS_DISK):
+            (vm_dir / name).symlink_to(real / name)
+        os.link(image_disk(real, DEFAULT_IMAGE), image_disk(vm_dir, "copy"))
+        backend = FirecrackerBackend(vm_dir / "machines", vm_dir=vm_dir)
+        try:
+            workspace = Workspace(backend, MachineSpec(image="copy", mem_mib=512))
+            await workspace.start()
+            before = await output(workspace, "cat /etc/os-release | head -1")
+            await workspace.checkpoint("saved")
+            # Rebuilt (`chronobox build` replaces the file in one step), then even deleted: the
+            # saved machine still has the disk it was taken on.
+            os.link(image_disk(real, DEFAULT_IMAGE), vm_dir / "rebuilt.ext4")
+            (vm_dir / "rebuilt.ext4").replace(image_disk(vm_dir, "copy"))
+            image_disk(vm_dir, "copy").unlink()
+            await workspace.rollback("saved")
+            assert await output(workspace, "cat /etc/os-release | head -1") == before
+        finally:
+            await backend.cleanup()
+    finally:
+        shutil.rmtree(vm_dir)

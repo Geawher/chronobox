@@ -64,12 +64,22 @@ def test_build_needs_exactly_one_source_and_the_tools_drive(tmp_path: Path) -> N
         build_image(tmp_path, reference="postgres:16")
 
 
+@pytest.mark.parametrize("name", ["../escape", "a/b", "MyApp", "-x"])
+def test_bad_image_names_are_refused_before_anything_is_built(tmp_path: Path, name: str) -> None:
+    (tmp_path / TOOLS_DISK).touch()
+    with pytest.raises(ImageError, match="bad image name"):
+        build_image(tmp_path, reference="postgres:16", name=name)
+    assert not (tmp_path / "images").exists()
+
+
 async def test_starting_a_machine_of_an_unbuilt_image_says_how_to_build_it(tmp_path: Path) -> None:
     for name in VM_FILES:
         (tmp_path / name).touch()
     backend = FirecrackerBackend(tmp_path / "vms", vm_dir=tmp_path)
     with pytest.raises(VMError, match="chronobox build"):
         await backend.start(MachineSpec(image="postgres-16"))
+    with pytest.raises(VMError, match="chronobox build"):
+        await backend.start(MachineSpec(image="../images/postgres-16"))
     await backend.cleanup()
 
 
