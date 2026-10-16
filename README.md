@@ -102,7 +102,9 @@ another filesystem than the VM files).
 
 A `chronobox.toml` next to your code says how to bring it up; the agent then works on an
 exact, running copy of it ([example](examples/notes/chronobox.toml): a web app and its
-PostgreSQL database):
+PostgreSQL database). `chronobox init` writes a commented starter file: it takes your
+`Dockerfile` as the image if there is one and excludes the usual heavy folders; you add the
+services and setup:
 
 ```toml
 image = { dockerfile = "Dockerfile.dev" }   # or "name" of a built image, or { reference = "postgres:16" }
@@ -125,6 +127,7 @@ env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 
 ```bash
 cd path/to/app
+chronobox init                     # a starter chronobox.toml (never overwrites one)
 chronobox build --project .        # the image it declares, once
 chronobox warm                     # optional: prepare the warm start now, not in the first session
 claude mcp add chronobox -- chronobox mcp --project .

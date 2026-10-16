@@ -5,6 +5,7 @@
     chronobox build --dockerfile ./Dockerfile        # or one built from a Dockerfile
     chronobox build --project .                      # the image a chronobox.toml declares
     chronobox images                                 # what is built
+    chronobox init                                   # a starter chronobox.toml for the project here
     chronobox warm                                   # boot the project here once, save its warm start
     chronobox up                                     # keep the project's machine running
     chronobox cp ./fixtures main:/src/fixtures       # copy into it (or out: main:/src/app.py ./out)
@@ -26,7 +27,14 @@ import sys
 from pathlib import Path
 
 from chronobox import server
-from chronobox.config import ConfigError, ImageSource, ProjectConfig, load_config
+from chronobox.config import (
+    CONFIG_FILE,
+    ConfigError,
+    ImageSource,
+    ProjectConfig,
+    load_config,
+    starter_config,
+)
 from chronobox.copying import CopyError, check_direction, pack_local, parse_location, unpack_local
 from chronobox.images import Image, ImageError, build_image, build_tools, list_images
 from chronobox.project import ProjectBoot, default_warm_dir, session_root, up_socket
@@ -86,6 +94,33 @@ def show_images(args: argparse.Namespace) -> None:
     width = max(len(image.name) for image in images)
     for image in images:
         print(f"{image.name:<{width}}  {image.size_bytes / BYTES_PER_MIB:>7.0f} MiB  {image.config.source}")
+
+
+def init(args: argparse.Namespace) -> None:
+    """``chronobox init``: write a starter ``chronobox.toml`` in the project folder, then say what next.
+
+    Raises:
+        ConfigError: If the folder does not exist or already has a ``chronobox.toml``.
+    """
+    folder = args.project.resolve()
+    file = folder / CONFIG_FILE
+    try:
+        with file.open("x") as config:
+            config.write(starter_config(folder))
+    except FileExistsError:
+        raise ConfigError(f"{file} already exists") from None
+    except FileNotFoundError:
+        raise ConfigError(f"no folder {folder}") from None
+    steps = ["chronobox build --project .  # the image, from the Dockerfile"]
+    if load_config(folder).image.dockerfile is None:
+        steps = []
+    steps += [
+        "chronobox warm               # optional: prepare the warm start now",
+        "claude mcp add chronobox -- chronobox mcp --project .",
+    ]
+    print(f"wrote {file}\nnext: add the project's services and setup, then:")
+    for step in steps:
+        print(f"  {step}")
 
 
 def warm(args: argparse.Namespace) -> None:
@@ -215,6 +250,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     images_parser.set_defaults(handler=show_images)
 
     project_commands = {
+        "init": ("write a starter chronobox.toml", init),
         "warm": ("boot a project once and save its warm start", warm),
         "up": ("keep a project's machine running (Ctrl-C stops it)", up),
         "down": ("stop the machine `chronobox up` keeps", down),

@@ -29,6 +29,7 @@ install belongs in the image.
 
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -41,6 +42,14 @@ CONFIG_FILE = "chronobox.toml"
 DEFAULT_TARGET = "/src"
 DEFAULT_EXCLUDES = (".git", ".chronobox")
 DEFAULT_READY_TIMEOUT_S = 120.0
+DEFAULT_MEM_MIB = 1024
+DEFAULT_DISK_MIB = 2048
+DOCKERFILE = "Dockerfile"
+# Folders usually too heavy or too machine-specific to copy; `chronobox init` excludes those it finds.
+COMMON_EXCLUDES = (
+    "node_modules", ".venv", "venv", "__pycache__", "target", "dist",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache",
+)  # fmt: skip
 TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service"})
 MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
 PROJECT_KEYS = frozenset({"path", "target", "exclude"})
@@ -49,6 +58,34 @@ SERVICE_KEYS = frozenset({"name", "start", "ready", "env", "workdir", "restart",
 # Service names become file names in commands, so keep them to what needs no quoting.
 SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# What `chronobox init` writes: every option, commented, around the values it could guess.
+STARTER_TEMPLATE = """\
+# How to bring this project up in a chronobox machine (docs: README, "Your project").
+# Machines have no network: everything the project needs must be installed in the image.
+
+image = {image}
+# image = "myapp"                          # an image built with `chronobox build`
+# image = {{ reference = "postgres:16" }}    # a Docker image, as is
+# image = {{ dockerfile = "Dockerfile" }}    # built from a Dockerfile (context: its folder)
+
+# Commands run in the project folder in the machine, when it is prepared.
+prepare = []  # after the project is copied in, before the services, e.g. ["make build"]
+setup = []    # once every service is ready, e.g. ["bin/migrate", "bin/seed"]
+
+[machine]
+mem_mib = {mem_mib}
+disk_mib = {disk_mib}
+
+[project]
+exclude = {exclude}  # not copied in (.git and .chronobox never are)
+
+# One block per long-running process, started in order; each must be ready before the next.
+# [[service]]
+# name = "db"
+# start = "docker-entrypoint.sh postgres"  # runs in the foreground; restarted if it exits
+# ready = "pg_isready -h 127.0.0.1"        # succeeds once the service answers
+# env = {{ POSTGRES_HOST_AUTH_METHOD = "trust" }}
+"""
 
 
 class ConfigError(ValueError):
@@ -122,8 +159,8 @@ class ProjectConfig:
     prepare: tuple[str, ...] = ()
     services: tuple[Service, ...] = ()
     setup: tuple[str, ...] = ()
-    mem_mib: int = 1024
-    disk_mib: int = 2048
+    mem_mib: int = DEFAULT_MEM_MIB
+    disk_mib: int = DEFAULT_DISK_MIB
     vcpus: int = 2
     command_timeout: float = 300.0
 
@@ -166,10 +203,24 @@ def load_config(project: Path) -> ProjectConfig:
         prepare=tuple(_list(raw, "prepare", str)),
         services=services,
         setup=tuple(_list(raw, "setup", str)),
-        mem_mib=int(machine.get("mem_mib", 1024)),
-        disk_mib=int(machine.get("disk_mib", 2048)),
+        mem_mib=int(machine.get("mem_mib", DEFAULT_MEM_MIB)),
+        disk_mib=int(machine.get("disk_mib", DEFAULT_DISK_MIB)),
         vcpus=int(machine.get("vcpus", 2)),
         command_timeout=float(machine.get("command_timeout", 300.0)),
+    )
+
+
+def starter_config(folder: Path) -> str:
+    """A commented ``chronobox.toml`` for ``folder``, valid as it is (``chronobox init``).
+
+    The image is the folder's ``Dockerfile`` if it has one, else the default image; the usual heavy
+    folders it holds are excluded. Services stay a commented example: only the project knows them.
+    """
+    has_dockerfile = (folder / DOCKERFILE).is_file()
+    image = f'{{ dockerfile = "{DOCKERFILE}" }}' if has_dockerfile else json.dumps(DEFAULT_IMAGE)
+    excludes = [name for name in COMMON_EXCLUDES if (folder / name).exists()]
+    return STARTER_TEMPLATE.format(
+        image=image, exclude=json.dumps(excludes), mem_mib=DEFAULT_MEM_MIB, disk_mib=DEFAULT_DISK_MIB
     )
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from chronobox.cli import parse_args, serve_mcp
+from chronobox.cli import main, parse_args, serve_mcp
 from chronobox.copying import CopyError, Location, check_direction, pack_local, parse_location, unpack_local
 
 
@@ -70,3 +70,13 @@ def test_options_after_mcp_go_to_the_server() -> None:
     assert args.handler is serve_mcp and args.server_args == ["--help", "--project", "."]
     with pytest.raises(SystemExit):
         parse_args(["images", "--bogus"])
+
+
+def test_init_writes_a_starter_config_once(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """``chronobox init`` writes a ``chronobox.toml`` and says what to do next, but never overwrites
+    one: a project's own config is not replaced by a template."""
+    main(["init", "--project", str(tmp_path)])
+    assert (tmp_path / "chronobox.toml").read_text().startswith("# How to bring this project up")
+    assert "chronobox mcp --project ." in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="already exists"):
+        main(["init", "--project", str(tmp_path)])

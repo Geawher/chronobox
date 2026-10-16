@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from chronobox.config import DEFAULT_EXCLUDES, ConfigError, load_config
+from chronobox.config import DEFAULT_EXCLUDES, ConfigError, load_config, starter_config
+from chronobox.images import DEFAULT_IMAGE
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "notes"
 
@@ -95,3 +96,18 @@ def test_a_missing_file_says_where_it_looked(tmp_path: Path) -> None:
     """A folder without chronobox.toml fails with a message saying so."""
     with pytest.raises(ConfigError, match="no chronobox.toml"):
         load_config(tmp_path)
+
+
+def test_a_starter_config_is_valid_and_uses_what_the_folder_has(tmp_path: Path) -> None:
+    """``chronobox init``'s file loads as it is: the folder's Dockerfile as the image when there is
+    one, and only the heavy folders that exist excluded; without a Dockerfile, the default image."""
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n")
+    (tmp_path / "node_modules").mkdir()
+    config = load_config(write(tmp_path, starter_config(tmp_path)))
+    assert config.image.dockerfile == tmp_path / "Dockerfile"
+    assert config.exclude == (*DEFAULT_EXCLUDES, "node_modules")
+    assert (config.services, config.prepare, config.setup) == ((), (), ())
+
+    (tmp_path / "Dockerfile").unlink()
+    config = load_config(write(tmp_path, starter_config(tmp_path)))
+    assert (config.image.name, config.image.dockerfile) == (DEFAULT_IMAGE, None)
