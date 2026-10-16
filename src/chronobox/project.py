@@ -51,8 +51,9 @@ PARTIAL_SUFFIX = ".partial"
 STALE_PARTIAL_S = 3600  # a half-written warm snapshot this old was left by a crash
 # Bump when what a prepared machine holds changes (e.g. how services are started), so warm
 # snapshots made by older code are not reused.
-WARM_FORMAT = "3"
+WARM_FORMAT = "4"
 BASELINE = "project.tar"  # the project once the machine was ready: what diffs compare against
+COPIED = "copied.tar"  # the local files as copied in: what `sync` finds local edits against
 NO_DIFFERENCES = 0
 DIFFERENCES = 1
 DIFF_COMMAND = (
@@ -65,6 +66,7 @@ SIDE_FOLDER = re.compile(r'(?<=[\s"])([ab]/)(?:host|machine)/')
 RENAME_FOLDER = re.compile(r"^(rename (?:from|to) )(?:host|machine)/")
 DIFF_HEADERS = ("diff --git ", "--- ", "+++ ", "rename from ", "rename to ", "Binary files ")
 SPECIAL_FILES = (tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.FIFOTYPE)
+SHOWN_NAMES = 10
 
 
 class ProjectError(Exception):
@@ -209,6 +211,7 @@ class ProjectBoot:
         self.was_warm = False
         self.seconds = 0.0
         self.baseline = backend.root / BASELINE
+        self.copied = backend.root / COPIED
 
     async def __call__(self) -> Booted:
         """Start the main machine, warm if a matching warm snapshot exists; ``seconds`` records
@@ -244,6 +247,7 @@ class ProjectBoot:
             return None
         self.was_warm = True
         self.baseline = warm / BASELINE
+        self.copied = warm / COPIED
         return Booted(machine, snapshot)
 
     async def _fresh(self, warm: Path | None) -> Booted:
@@ -276,6 +280,7 @@ class ProjectBoot:
         """
         config = self.config
         archive = await asyncio.to_thread(pack_project, config)
+        self.copied.write_bytes(archive)
         await machine.put(config.target, archive)
         await _check(machine, f"cd {shlex.quote(config.target)}", "enter the project")
         for command in config.prepare:
@@ -304,6 +309,7 @@ class ProjectBoot:
         try:
             await self.backend.save(machine, partial)
             shutil.copyfile(self.baseline, partial / BASELINE)
+            shutil.copyfile(self.copied, partial / COPIED)
             (partial / WARM_COMPLETE).touch()
             partial.rename(warm)
         except (OSError, VMError) as error:
@@ -396,8 +402,58 @@ def _export_destination(exports: Path, path: str) -> Path:
     return destination
 
 
+def local_edits(copied: bytes, current: bytes) -> tuple[bytes, list[str], list[str]]:
+    """What changed in the local project since it was copied in.
+
+    Args:
+        copied: The project as copied into the machine (a ``pack_project`` archive).
+        current: The project as it is locally now (another ``pack_project`` archive).
+
+    Returns:
+        An archive of the files and links that are new or different (with their folders), their
+        names, and the names of files and links deleted locally.
+    """
+    before = _members(copied)
+    now = _members(current)
+    changed = sorted(
+        name
+        for name, (info, data) in now.items()
+        if not info.isdir() and (name not in before or _identity(*before[name]) != _identity(info, data))
+    )
+    deleted = sorted(name for name, (info, _) in before.items() if not info.isdir() and name not in now)
+    folders = {str(parent) for name in changed for parent in PurePosixPath(name).parents} - {"."}
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        for name in sorted(folders & now.keys()):
+            tar.addfile(now[name][0])
+        for name in changed:
+            info, data = now[name]
+            tar.addfile(info, io.BytesIO(data) if info.isfile() else None)
+    return buffer.getvalue(), changed, deleted
+
+
+async def sync_local(machine: Machine, config: ProjectConfig, copied: bytes) -> tuple[list[str], list[str]]:
+    """Copy the local project's edits since it was copied in (new, changed and deleted files) into
+    the machine's project folder; everything else there stays as the machine has it.
+
+    Returns:
+        The names copied and the names deleted.
+
+    Raises:
+        VMError: If the files cannot be written or deleted in the machine.
+    """
+    current = await asyncio.to_thread(pack_project, config)
+    archive, changed, deleted = local_edits(copied, current)
+    if deleted:
+        names = " ".join(shlex.quote(name) for name in deleted)
+        await _check(machine, f"cd {shlex.quote(config.target)} && rm -f -- {names}", "sync deletions")
+    if changed:
+        await machine.put(config.target, archive)
+    return changed, deleted
+
+
 def project_tools(workspace: Workspace, boot: ProjectBoot) -> dict[str, Method]:
-    """The project's tool methods (``diff``, ``export``), for ``WorkspaceService.extra_methods``."""
+    """The project's tool methods (``diff``, ``export``, ``sync``), for ``WorkspaceService.extra_methods``."""
     config = boot.config
 
     async def diff(where: str = MAIN) -> str:
@@ -418,7 +474,20 @@ def project_tools(workspace: Workspace, boot: ProjectBoot) -> dict[str, Method]:
             return f"error: {error}"
         return f"copied {path} from {where} to {destination}"
 
-    return {"diff": diff, "export": export_path}
+    async def sync(where: str = MAIN) -> str:
+        """The ``sync`` tool: copy local edits into ``where``; failures come back as ``error: ...``."""
+        try:
+            copied = await asyncio.to_thread(boot.copied.read_bytes)
+            changed, deleted = await sync_local(workspace.machine(where), config, copied)
+        except (VMError, tarfile.TarError, OSError) as error:
+            return f"error: {error}"
+        if not changed and not deleted:
+            return f"no local edits to sync: the local files of {config.path.name} are as they were copied in"
+        parts = [f"copied {len(changed)} file(s): {_names(changed)}"] if changed else []
+        parts += [f"deleted {len(deleted)} file(s): {_names(deleted)}"] if deleted else []
+        return f"{'; '.join(parts)} (in {config.target} on {where})"
+
+    return {"diff": diff, "export": export_path, "sync": sync}
 
 
 def project_note(config: ProjectConfig) -> str:
@@ -428,7 +497,10 @@ def project_note(config: ProjectConfig) -> str:
         f"The project {config.path.name} is copied at {config.target} in the machine (commands start "
         f"there). Its services ({services}) are running, restarted if they exit; logs in {LOG_DIR}. "
         "`diff` shows what changed in the project on the main machine or a fork since the machine "
-        "started, as a patch for the local copy; `export` copies files out of the machine."
+        "started, as a patch for the local copy; `export` copies files out of the machine. The "
+        "project's services and dependencies run only in the machine: if you edit the project's "
+        "files locally, `sync` copies your edits into main or a fork so you can run and test them "
+        "there."
     )
 
 
@@ -497,6 +569,29 @@ def _keep_links_skip_special(member: tarfile.TarInfo, destination: str) -> tarfi
     if member.type in SPECIAL_FILES:
         return None
     return tarfile.tar_filter(member, destination)
+
+
+def _members(archive: bytes) -> dict[str, tuple[tarfile.TarInfo, bytes]]:
+    """Each member of a project archive by its normalized name, with its content (empty for
+    folders and links)."""
+    members: dict[str, tuple[tarfile.TarInfo, bytes]] = {}
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        for info in tar.getmembers():
+            data = tar.extractfile(info).read() if info.isfile() else b""
+            members[str(PurePosixPath(info.name))] = (info, data)
+    return members
+
+
+def _identity(info: tarfile.TarInfo, data: bytes) -> tuple[bytes, int, str, bytes]:
+    """What makes a file the same for ``local_edits``: type, mode, link target and content (not
+    its time, so touching a file is not an edit)."""
+    return info.type, info.mode, info.linkname, data
+
+
+def _names(names: list[str]) -> str:
+    """The first few names, comma-separated, with a count of the rest."""
+    shown = ", ".join(names[:SHOWN_NAMES])
+    return shown if len(names) <= SHOWN_NAMES else f"{shown} and {len(names) - SHOWN_NAMES} more"
 
 
 def _holds_a_folder(archive: bytes) -> bool:
