@@ -27,6 +27,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
+from chronobox.images import DEFAULT_IMAGE
 from chronobox.service import WorkspaceService, call_remote
 from chronobox.vm import FirecrackerBackend, MachineSpec
 from chronobox.workspace import MAIN, Profile, Workspace
@@ -137,7 +138,11 @@ def build_server(profile: Profile, call: Call, *, guard: bool = False) -> MCPSer
 def machine_spec(args: argparse.Namespace) -> MachineSpec:
     setup = (args.setup.read_text(),) if args.setup else ()
     return MachineSpec(
-        setup=setup, mem_mib=args.mem, data_mib=args.disk, command_timeout=args.command_timeout
+        setup=setup,
+        image=args.image,
+        mem_mib=args.mem,
+        data_mib=args.disk,
+        command_timeout=args.command_timeout,
     )
 
 
@@ -196,6 +201,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--http", metavar="HOST:PORT", help="with --connect: serve MCP over HTTP")
     parser.add_argument("--http-token", default="mcp", help="secret URL path segment for --http")
     parser.add_argument("--setup", type=Path, help="shell script run once in the VM after boot")
+    parser.add_argument("--image", default=DEFAULT_IMAGE, help="the machine's image (see `chronobox images`)")
     parser.add_argument("--mem", type=int, default=1024, help="VM memory in MiB")
     parser.add_argument("--disk", type=int, default=2048, help="writable disk in MiB")
     parser.add_argument("--command-timeout", type=float, default=300.0)
