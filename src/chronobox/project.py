@@ -490,10 +490,11 @@ def project_tools(workspace: Workspace, boot: ProjectBoot) -> dict[str, Method]:
     return {"diff": diff, "export": export_path, "sync": sync}
 
 
-def project_note(config: ProjectConfig) -> str:
-    """What the agent is told about the project, next to the profile's instructions."""
+def project_note(config: ProjectConfig, *, with_handoff: bool = False) -> str:
+    """What the agent is told about the project, next to the profile's instructions; ``with_handoff``
+    adds ``verify_script``, which only the chronobox profile (with forks) has."""
     services = ", ".join(service.name for service in config.services) or "none"
-    return (
+    note = (
         f"The project {config.path.name} is copied at {config.target} in the machine (commands start "
         f"there). Its services ({services}) are running, restarted if they exit; logs in {LOG_DIR}. "
         "`diff` shows what changed in the project on the main machine or a fork since the machine "
@@ -501,6 +502,13 @@ def project_note(config: ProjectConfig) -> str:
         "project's services and dependencies run only in the machine: if you edit the project's "
         "files locally, `sync` copies your edits into main or a fork so you can run and test them "
         "there."
+    )
+    if not with_handoff:
+        return note
+    return (
+        f"{note} When a change needs actions beyond file edits (a migration, restarts, settings "
+        "outside the project), write them as a script and check it with `verify_script`, which "
+        "replays it on a fresh fork and saves it with the patch for the user."
     )
 
 

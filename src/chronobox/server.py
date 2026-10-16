@@ -31,6 +31,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 from chronobox.config import ConfigError, ProjectConfig, load_config
+from chronobox.handoff import handoff_tools
 from chronobox.images import DEFAULT_IMAGE
 from chronobox.project import (
     ProjectBoot,
@@ -83,7 +84,7 @@ def build_server(
     """MCP tools for a profile; every tool forwards to ``call(method, *args)``.
 
     With ``project_note`` (a project from ``chronobox.toml``), the agent is also told about the
-    project and gets its ``diff``, ``export`` and ``sync`` tools.
+    project and gets its ``diff``, ``export`` and ``sync`` tools (and ``verify_script`` with forks).
     """
     instructions = INSTRUCTIONS[profile] + (f" {project_note}" if project_note else "")
     server = MCPServer("chronobox", instructions=instructions)
@@ -163,6 +164,21 @@ def build_server(
         session started are synced; everything else on the machine stays as it is."""
         return await call("sync", where)
 
+    async def verify_script(
+        script: str, check: str = "", code_from: str = MAIN, checkpoint: str = "start"
+    ) -> str:
+        """Check a change script the way the user will run it on the real machine, and hand it over
+        with the patch. Use it when the change needs actions and not only file edits: a migration
+        or a backfill, restarting services in order, a setting outside the project. The script
+        runs with sh (or its #! interpreter) in the project folder, on a new fork of `checkpoint`
+        (default: the machine as it was before your work) after the project files of `code_from`
+        are deployed there; `check`, if given, runs after it to confirm the result. When both
+        succeed, the patch, the script and the replay's report are saved in
+        .chronobox/exports/handoff/ for the user; otherwise you get the output to fix it. Write
+        the script for the real machine: no values you only saw in this session, and safe to run
+        twice where you can."""
+        return await call("verify_script", script, check, code_from, checkpoint)
+
     tools: list[Call] = [run_guarded if guard else run, wait]
     if profile in (Profile.ROLLBACK, Profile.CHRONOBOX):
         tools += [checkpoint, list_checkpoints, rollback]
@@ -170,6 +186,8 @@ def build_server(
         tools += [fork, compare, changes, promote, discard]
     if project_note:
         tools += [diff, export, sync]
+        if profile is Profile.CHRONOBOX:
+            tools.append(verify_script)
     for tool in tools:
         server.add_tool(tool, name=tool.__name__.removesuffix("_guarded"))
     return server
@@ -276,6 +294,8 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
         workspace = Workspace(backend, spec, profile=args.profile, guard=args.guard, boot=boot)
         service = WorkspaceService(workspace)
         service.extra_methods.update(project_tools(workspace, boot))
+        if args.profile is Profile.CHRONOBOX:
+            service.extra_methods.update(handoff_tools(workspace, boot))
     booting = asyncio.create_task(service.boot())
     try:
         yield service
@@ -318,7 +338,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _note(args: argparse.Namespace) -> str | None:
     """The project note for the agent's instructions, if serving a project."""
     project = load_project(args)
-    return project_note(project) if project else None
+    return project_note(project, with_handoff=args.profile is Profile.CHRONOBOX) if project else None
 
 
 def main(argv: list[str] | None = None) -> None:

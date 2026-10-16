@@ -152,6 +152,13 @@ claude mcp add chronobox -- chronobox mcp --project .
   - `sync(where)`: copy local edits of the project's files (new, changed, deleted since the
     session started) into main or a fork, for an agent that edits files locally but needs the
     machine to run them.
+- **Hand-off scripts**: some changes are actions, not file edits (a migration, a backfill,
+  restarting services in order, a setting outside the project). The agent writes them as a
+  script and calls `verify_script(script, check)`: chronobox starts a new fork from the
+  `start` checkpoint (the machine before the agent's work), deploys the project's changed
+  files there, runs the script and then the check. If both succeed, the patch, the script
+  and the replay's report are saved in `.chronobox/exports/handoff/`, ready to apply to the
+  real machine; the fork stays open to inspect.
 - Machines have no network: install everything in the image.
 
 To work on the same machine as the agent, keep it running yourself:
