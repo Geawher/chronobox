@@ -7,6 +7,8 @@ Three ways to run it:
 
       claude mcp add chronobox -- uv run --project /path/to/chronobox chronobox-mcp
 
+  or, in a project with a ``chronobox.toml``, ``chronobox mcp --project .``;
+
 - ``--serve SOCKET``: owns the VM and serves it on a unix socket, with no MCP of its
   own, so the machine outlives any agent session (benchmarks, long jobs);
 - ``--connect SOCKET``: a thin MCP front end for a ``--serve`` process, over stdio or,
@@ -20,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -27,8 +30,18 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
+from chronobox.config import ConfigError, ProjectConfig, load_config
 from chronobox.images import DEFAULT_IMAGE
-from chronobox.service import WorkspaceService, call_remote
+from chronobox.project import (
+    ProjectBoot,
+    default_warm_dir,
+    project_note,
+    project_tools,
+    session_root,
+    up_socket,
+)
+from chronobox.project import machine_spec as project_machine_spec
+from chronobox.service import WorkspaceService, call_remote, is_serving
 from chronobox.vm import FirecrackerBackend, MachineSpec
 from chronobox.workspace import MAIN, Profile, Workspace
 
@@ -64,9 +77,16 @@ INSTRUCTIONS = {
 Call = Callable[..., Awaitable[str]]
 
 
-def build_server(profile: Profile, call: Call, *, guard: bool = False) -> MCPServer:
-    """MCP tools for a profile; every tool forwards to ``call(method, *args)``."""
-    server = MCPServer("chronobox", instructions=INSTRUCTIONS[profile])
+def build_server(
+    profile: Profile, call: Call, *, guard: bool = False, project_note: str | None = None
+) -> MCPServer:
+    """MCP tools for a profile; every tool forwards to ``call(method, *args)``.
+
+    With ``project_note`` (a project from ``chronobox.toml``), the agent is also told about the
+    project and gets its ``diff`` and ``export`` tools.
+    """
+    instructions = INSTRUCTIONS[profile] + (f" {project_note}" if project_note else "")
+    server = MCPServer("chronobox", instructions=instructions)
 
     async def run(command: str, where: str = MAIN) -> str:
         """Run one shell command (bash, as root) on the main machine or on a fork. The
@@ -125,17 +145,40 @@ def build_server(profile: Profile, call: Call, *, guard: bool = False) -> MCPSer
         """Delete a fork, optionally recording what you learned from it."""
         return await call("discard", name, lesson)
 
+    async def diff(where: str = MAIN) -> str:
+        """Show what changed in the project folder on the main machine or a fork, as a patch
+        against the local copy of the project. Apply it locally (e.g. `git apply`) to keep a
+        change you verified."""
+        return await call("diff", where)
+
+    async def export(path: str, where: str = MAIN) -> str:
+        """Copy a file or folder from the main machine or a fork into the local project's
+        .chronobox/exports/<where>/ folder (results, dumps, logs)."""
+        return await call("export", path, where)
+
     tools: list[Call] = [run_guarded if guard else run, wait]
     if profile in (Profile.ROLLBACK, Profile.CHRONOBOX):
         tools += [checkpoint, list_checkpoints, rollback]
     if profile is Profile.CHRONOBOX:
         tools += [fork, compare, changes, promote, discard]
+    if project_note:
+        tools += [diff, export]
     for tool in tools:
         server.add_tool(tool, name=tool.__name__.removesuffix("_guarded"))
     return server
 
 
+def load_project(args: argparse.Namespace) -> ProjectConfig | None:
+    """The project's config when ``--project`` is given, else ``None``.
+
+    Raises:
+        ConfigError: If the project's ``chronobox.toml`` is missing or invalid.
+    """
+    return load_config(args.project) if args.project else None
+
+
 def machine_spec(args: argparse.Namespace) -> MachineSpec:
+    """The machine described by the command-line options (no project): image, setup script, size."""
     setup = (args.setup.read_text(),) if args.setup else ()
     return MachineSpec(
         setup=setup,
@@ -147,22 +190,54 @@ def machine_spec(args: argparse.Namespace) -> MachineSpec:
 
 
 async def run_local(args: argparse.Namespace) -> None:
+    """Own a machine and serve it to one agent over stdio MCP; the machine stops when the agent leaves."""
     async with _owned_service(args) as service:
-        server = build_server(args.profile, service.call, guard=args.guard)
+        server = build_server(args.profile, service.call, guard=args.guard, project_note=_note(args))
         await server.run_stdio_async()
 
 
 async def run_serving(args: argparse.Namespace) -> None:
+    """Own a machine and serve it on ``--serve``'s unix socket until a shutdown request.
+
+    For a project (``chronobox up``), also say on stderr whether it came up; a machine that failed
+    to start exits instead of serving errors. The socket file is removed on the way out.
+
+    Raises:
+        SystemExit: If a project's machine failed to start.
+    """
     async with _owned_service(args) as service:
         await service.serve(args.serve)
-        await service.stopped.wait()
+        try:
+            if args.project:
+                await service.ready.wait()
+                print(_up_message(args.project, service), file=sys.stderr, flush=True)
+                if service.error:
+                    # Agents would connect to it and get only errors; better none is up.
+                    raise SystemExit(1)
+            await service.stopped.wait()
+        finally:
+            args.serve.unlink(missing_ok=True)
+
+
+def _up_message(project: Path, service: WorkspaceService) -> str:
+    """What ``chronobox up`` prints once the boot is over: the failure, or how to use the machine."""
+    if service.error:
+        return f"chronobox: the machine failed to start: {service.error}"
+    folder = load_config(project).path
+    return (
+        f"chronobox: {folder} is up. Agents started with `chronobox mcp --project` use this machine; "
+        "`chronobox cp` copies files in and out; Ctrl-C or `chronobox down` stops it."
+    )
 
 
 async def run_connected(args: argparse.Namespace) -> None:
+    """Serve MCP (stdio, or HTTP with ``--http``) for the machine a ``--serve`` process owns."""
+
     async def call(method: str, *call_args: Any) -> str:
+        """Forward one tool call to the serving process."""
         return await call_remote(args.connect, method, *call_args)
 
-    server = build_server(args.profile, call, guard=args.guard)
+    server = build_server(args.profile, call, guard=args.guard, project_note=_note(args))
     if not args.http:
         await server.run_stdio_async()
         return
@@ -177,20 +252,35 @@ async def run_connected(args: argparse.Namespace) -> None:
 
 @contextlib.asynccontextmanager
 async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-def]
-    backend = FirecrackerBackend(args.root)
-    workspace = Workspace(backend, machine_spec(args), profile=args.profile, guard=args.guard)
-    service = WorkspaceService(workspace)
-    boot = asyncio.create_task(service.boot())
+    """A booting workspace service for the options (a project's or a plain machine), stopped and
+    cleaned up on exit.
+
+    The boot runs in the background, so the server answers at once; tool calls wait for it.
+    """
+    project = load_project(args)
+    # A project's server runs from the project's folder: keep its VMs out of it.
+    backend = FirecrackerBackend(args.root or (session_root() if project else None))
+    if project is None:
+        workspace = Workspace(backend, machine_spec(args), profile=args.profile, guard=args.guard)
+        service = WorkspaceService(workspace)
+    else:
+        boot = ProjectBoot(backend, project, None if args.no_warm else default_warm_dir())
+        spec = project_machine_spec(project)
+        workspace = Workspace(backend, spec, profile=args.profile, guard=args.guard, boot=boot)
+        service = WorkspaceService(workspace)
+        service.extra_methods.update(project_tools(workspace, boot))
+    booting = asyncio.create_task(service.boot())
     try:
         yield service
     finally:
-        boot.cancel()
+        booting.cancel()
         await workspace.close()
         await backend.cleanup()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    """Parse ``chronobox-mcp`` options; ``--http`` needs ``--connect``, ``--setup`` excludes ``--project``."""
+    parser = argparse.ArgumentParser(prog="chronobox-mcp", description=__doc__.splitlines()[0])
     parser.add_argument("--profile", type=Profile, choices=list(Profile), default=Profile.CHRONOBOX)
     parser.add_argument(
         "--guard", action="store_true", help="refuse unrehearsed destructive commands on main"
@@ -200,6 +290,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--connect", type=Path, metavar="SOCKET", help="MCP front end for a --serve process")
     parser.add_argument("--http", metavar="HOST:PORT", help="with --connect: serve MCP over HTTP")
     parser.add_argument("--http-token", default="mcp", help="secret URL path segment for --http")
+    parser.add_argument(
+        "--project", type=Path, help="a project folder with chronobox.toml (sets image, setup, size)"
+    )
+    parser.add_argument("--no-warm", action="store_true", help="with --project: always boot fresh")
     parser.add_argument("--setup", type=Path, help="shell script run once in the VM after boot")
     parser.add_argument("--image", default=DEFAULT_IMAGE, help="the machine's image (see `chronobox images`)")
     parser.add_argument("--mem", type=int, default=1024, help="VM memory in MiB")
@@ -209,11 +303,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.http and not args.connect:
         parser.error("--http needs --connect")
+    if args.project and args.setup:
+        parser.error("--setup does not go with --project (use prepare/setup in chronobox.toml)")
     return args
 
 
-def main() -> None:
-    args = parse_args()
+def _note(args: argparse.Namespace) -> str | None:
+    """The project note for the agent's instructions, if serving a project."""
+    project = load_project(args)
+    return project_note(project) if project else None
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run ``chronobox-mcp``: join the project's ``up`` machine if one is serving, else own one.
+
+    Args:
+        argv: Options; the process's own when ``None`` (``chronobox up`` and ``chronobox mcp`` pass theirs).
+    """
+    args = parse_args(argv)
+    try:
+        project = load_project(args)
+    except ConfigError as error:
+        sys.exit(f"chronobox-mcp: {error}")
+    if project is not None and not (args.serve or args.connect):
+        # A machine `chronobox up` keeps running for this project is the one to work on.
+        socket_path = up_socket(project)
+        if asyncio.run(is_serving(socket_path)):
+            args.connect = socket_path
     if args.connect:
         asyncio.run(run_connected(args))
     elif args.serve:

@@ -1,0 +1,26 @@
+# A small notes web app and its PostgreSQL database, on chronobox's default image.
+#   uv run chronobox-mcp --project examples/notes
+image = "default"
+prepare = [
+  "install -d -o postgres -m 700 /var/lib/postgresql/data",
+  "su postgres -c '/usr/lib/postgresql/15/bin/initdb --no-instructions -A trust -D /var/lib/postgresql/data'",
+]
+setup = ["python3 migrate.py"]
+
+[machine]
+mem_mib = 1024
+disk_mib = 2048
+
+[project]
+exclude = ["__pycache__"]
+
+[[service]]
+name = "db"
+start = "su postgres -c '/usr/lib/postgresql/15/bin/postgres -D /var/lib/postgresql/data -c listen_addresses=127.0.0.1'"
+ready = "pg_isready -q -h 127.0.0.1 -U postgres"
+workdir = "/"
+
+[[service]]
+name = "app"
+start = "python3 app.py"
+ready = "curl -sf http://127.0.0.1:8000/health"

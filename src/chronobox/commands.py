@@ -48,14 +48,17 @@ _HARMLESS_REDIRECTS = re.compile(r"\d?>\s*/dev/null|\d?>&\d|&>\s*/dev/null")
 
 
 def is_risky(command: str) -> bool:
+    """Whether to checkpoint before the command (deletes, kills, restarts, SQL changes, overwrites)."""
     return bool(_RISKY.search(command))
 
 
 def needs_rehearsal(command: str) -> bool:
+    """Whether the guard wants the command to succeed on a fork before it runs on main."""
     return bool(_NEEDS_REHEARSAL.search(command))
 
 
 def changes_state(command: str) -> bool:
+    """Whether the command may change the machine: not clearly read-only, or it writes anyway."""
     command = _HARMLESS_REDIRECTS.sub("", command)
     return not _READ_ONLY.search(command) or bool(_WRITES.search(command))
 

@@ -42,18 +42,21 @@ NODE_GET = "wget -qO- 127.0.0.1:8080"
 
 
 def requires_image(name: str) -> pytest.MarkDecorator:
+    """Skip a test unless the named image is built in the VM files."""
     built = image_disk(default_vm_dir(), name).exists()
     return pytest.mark.skipif(not built, reason=f"image {name} not built (chronobox build --image ...)")
 
 
 @pytest.fixture
 async def backend(tmp_path: Path) -> AsyncIterator[FirecrackerBackend]:
+    """A backend whose VMs and snapshots are deleted after the test."""
     backend = FirecrackerBackend(tmp_path / "vms")
     yield backend
     await backend.cleanup()
 
 
 async def start(backend: FirecrackerBackend, image: str) -> Workspace:
+    """A started workspace on a machine of ``image``, with every chronobox tool."""
     workspace = Workspace(backend, MachineSpec(image=image, mem_mib=512), profile=Profile.CHRONOBOX)
     await workspace.start()
     return workspace
@@ -68,11 +71,14 @@ async def output(workspace: Workspace, command: str, where: str = MAIN) -> str:
 
 
 def start_node(reply: str) -> str:
+    """The command that starts the Node test server answering ``reply`` and waits until it serves."""
     return NODE_START.format(server=NODE_SERVER.format(reply=reply))
 
 
 @requires_image(POSTGRES)
 async def test_postgres_image_rolls_back_a_running_database(backend: FirecrackerBackend) -> None:
+    """On the postgres image, a rollback undoes a delete and the database server is back running, without a
+    restart."""
     workspace = await start(backend, POSTGRES)
     assert "accepting connections" in await workspace.run(POSTGRES_START)
     await workspace.run(f"{PSQL} \"create table orders (item text); insert into orders values ('kept')\"")
@@ -86,6 +92,7 @@ async def test_postgres_image_rolls_back_a_running_database(backend: Firecracker
 
 @requires_image(POSTGRES)
 async def test_postgres_fork_changes_only_the_copy(backend: FirecrackerBackend) -> None:
+    """A schema change on a fork of a running database leaves main's schema as it was."""
     workspace = await start(backend, POSTGRES)
     await workspace.run(POSTGRES_START)
     await workspace.run(f"{PSQL} \"create table orders (item text); insert into orders values ('a')\"")
@@ -97,6 +104,8 @@ async def test_postgres_fork_changes_only_the_copy(backend: FirecrackerBackend) 
 
 @requires_image(NODE)
 async def test_alpine_image_without_bash_or_python_runs_commands_in_sh(backend: FirecrackerBackend) -> None:
+    """An image with neither bash nor Python runs commands in its busybox sh, with its own environment;
+    ``cd``/``export`` persist, and a multi-line command never runs again from the saved state."""
     workspace = await start(backend, NODE)
     assert await output(workspace, "ls /bin/bash /usr/bin/python3 2>&1 | grep -c 'No such file'") == "2"
     assert await output(workspace, "readlink /proc/$$/exe") == "/bin/busybox"
@@ -112,6 +121,7 @@ async def test_alpine_image_without_bash_or_python_runs_commands_in_sh(backend: 
 
 @requires_image(NODE)
 async def test_node_fork_serves_a_different_app_while_main_keeps_serving(backend: FirecrackerBackend) -> None:
+    """A fork can replace the running app while main keeps serving the old one."""
     workspace = await start(backend, NODE)
     await workspace.run(start_node("v1"))
     await workspace.fork("next")
@@ -122,6 +132,7 @@ async def test_node_fork_serves_a_different_app_while_main_keeps_serving(backend
 
 @requires_image(NODE)
 async def test_isolated_commands_work_in_an_image_without_bash(backend: FirecrackerBackend) -> None:
+    """Isolated probes run in sh images too, and their mounts stay private."""
     workspace = await start(backend, NODE)
     assert workspace.main is not None
     code, text = await workspace.main.run("mount -t tmpfs tmpfs /mnt && echo private", isolated=True)
@@ -132,6 +143,7 @@ async def test_isolated_commands_work_in_an_image_without_bash(backend: Firecrac
 
 @requires_image(RUBY)
 async def test_ruby_image_keeps_its_environment_and_rolls_back(backend: FirecrackerBackend) -> None:
+    """The image's ``ENV`` (``GEM_HOME``) applies, and a rollback restores the app's file."""
     workspace = await start(backend, RUBY)
     assert (await output(workspace, "ruby -e 'puts RUBY_VERSION'")).startswith("3.3")
     assert await output(workspace, "echo $GEM_HOME") == "/usr/local/bundle"
@@ -143,6 +155,8 @@ async def test_ruby_image_keeps_its_environment_and_rolls_back(backend: Firecrac
 
 
 async def test_a_rebuilt_image_does_not_change_the_disk_under_a_saved_machine(tmp_path: Path) -> None:
+    """A checkpoint restores onto the disk it was taken on, even after the image was rebuilt and its file
+    deleted (machines and snapshots hold hard links to their disks)."""
     # VM files and machines of our own, on the filesystem of the real VM files: disks are kept
     # by hard links, which only work there (elsewhere machines fall back to symlinks).
     real = default_vm_dir()
