@@ -137,7 +137,9 @@ claude mcp add chronobox -- chronobox mcp --project .
 `uv run --project /path/to/chronobox chronobox`.)
 
 - The project is copied to `/src` (`[project] target`), where commands start.
-- Services run under a small restart loop, logs in `/var/log/chronobox/<name>.log`.
+- Services run under a small restart loop, logs in `/var/log/chronobox/<name>.log`. They start
+  before `setup`; one that needs it (an app server that needs the migrations `setup` runs)
+  says `after_setup = true`.
 - **Warm start**: the first session prepares the machine and saves it
   (`~/.cache/chronobox/warm`); later sessions restore it in about 0.1 s, as long as the
   config, the project's files and the image are unchanged (`--no-warm` to boot fresh). The
