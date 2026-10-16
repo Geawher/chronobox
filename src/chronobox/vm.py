@@ -56,6 +56,7 @@ GUEST_REPLY_MARGIN_S = 30.0
 GUEST_REPLY_LIMIT = 2**26  # one JSON line holds the whole output; callers shorten it
 TRANSFER_TIMEOUT_S = 300.0
 READY_TIMEOUT_S = 30.0
+BYTES_PER_MIB = 1024 * 1024
 API_SOCKET_WAIT_S = 2.0
 CONTENT_LENGTH = "content-length"
 _PR_SET_PDEATHSIG = 1
@@ -467,7 +468,7 @@ class FirecrackerBackend:
         template = self.root / f"data-template-{size_mib}.ext4"
         if not template.exists():
             with open(template, "wb") as disk:
-                disk.truncate(size_mib * 2**20)
+                disk.truncate(size_mib * BYTES_PER_MIB)
             subprocess.run(["mkfs.ext4", "-q", "-F", str(template)], check=True)
         _sparse_copy(template, path)
 
