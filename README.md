@@ -144,9 +144,14 @@ claude mcp add chronobox -- chronobox mcp --project .
   (`~/.cache/chronobox/warm`); later sessions restore it in about 0.1 s, as long as the
   config, the project's files and the image are unchanged (`--no-warm` to boot fresh). The
   saved machine is also the session's `start` checkpoint.
-- Two more tools: `diff(where)` (what changed in the project on main or a fork since the
-  machine was ready, as a patch for your local copy: `git apply` takes it; your own edits
-  since then, and files the project's setup wrote, stay out of it) and `export(path, where)` (copy files out to `.chronobox/exports/`).
+- Three more tools:
+  - `diff(where)`: what changed in the project on main or a fork since the machine was
+    ready, as a patch for your local copy (`git apply` takes it; your own edits since then,
+    and files the project's setup wrote, stay out of it);
+  - `export(path, where)`: copy files out to `.chronobox/exports/`;
+  - `sync(where)`: copy local edits of the project's files (new, changed, deleted since the
+    session started) into main or a fork, for an agent that edits files locally but needs the
+    machine to run them.
 - Machines have no network: install everything in the image.
 
 To work on the same machine as the agent, keep it running yourself:

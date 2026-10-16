@@ -22,7 +22,7 @@ from mcp.types import CallToolResult
 
 from chronobox.config import ProjectConfig, load_config
 from chronobox.images import image_disk
-from chronobox.project import ProjectBoot, export, machine_spec, project_diff
+from chronobox.project import ProjectBoot, export, machine_spec, project_diff, project_tools
 from chronobox.vm import FirecrackerBackend, MachineSpec, VMError, default_vm_dir
 from chronobox.workspace import MAIN, START, Workspace
 
@@ -167,7 +167,7 @@ async def test_the_mcp_server_serves_a_project_with_diff_and_export(
         initialized = await session.initialize()
         assert "/src" in (initialized.instructions or "")
         tools = {tool.name for tool in (await session.list_tools()).tools}
-        assert {"diff", "export"} <= tools
+        assert {"diff", "export", "sync"} <= tools
         result = await session.call_tool("diff", {})
         assert "no changes" in text_of(result)
 
@@ -253,4 +253,29 @@ async def test_files_the_setup_writes_are_not_reported_as_changes(
     await workspace.run("echo '# edited' >> app.py")
     patch = await project_diff(workspace.machine(MAIN), generated, baseline)
     assert "b/app.py" in patch and "media/photo.jpg" not in patch
+    await workspace.close()
+
+
+async def test_sync_copies_only_local_edits_into_a_fork(
+    project: ProjectConfig, backend: FirecrackerBackend
+) -> None:
+    """Local edits (a changed, a new and a deleted file) reach a fork with ``sync``, while the
+    fork's own changes to other files stay and main is untouched; with no edits it does nothing."""
+    workspace, boot = await start(backend, project, None)
+    tools = project_tools(workspace, boot)
+    assert (await tools["sync"]("main")).startswith("no local edits")
+    await workspace.fork("try")
+    await workspace.run("echo machine-only > notes.txt", where="try")
+    (project.path / "app.py").write_text((project.path / "app.py").read_text() + "# edited locally\n")
+    (project.path / "docs").mkdir()
+    (project.path / "docs" / "new.md").write_text("new\n")
+    (project.path / "migrate.py").unlink()
+    reply = await tools["sync"]("try")
+    assert "copied 2 file(s): app.py, docs/new.md" in reply and "deleted 1 file(s): migrate.py" in reply
+    state = "tail -1 app.py; cat docs/new.md notes.txt; test -e migrate.py && echo kept || echo gone"
+    assert await output(workspace, state, "try") == "# edited locally\nnew\nmachine-only\ngone"
+    original_last_line = (EXAMPLE / "app.py").read_text().splitlines()[-1].strip()
+    assert await output(workspace, "tail -1 app.py; test -e migrate.py && echo kept") == (
+        f"{original_last_line}\nkept"
+    )
     await workspace.close()
