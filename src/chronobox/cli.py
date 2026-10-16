@@ -17,7 +17,7 @@ from pathlib import Path
 from chronobox.images import ImageError, build_image, build_tools, list_images
 from chronobox.vm import default_vm_dir
 
-MIB = 2**20
+BYTES_PER_MIB = 1024 * 1024
 
 
 def build(args: argparse.Namespace) -> None:
@@ -27,7 +27,8 @@ def build(args: argparse.Namespace) -> None:
     image = build_image(
         args.vm_dir, reference=args.image, dockerfile=args.dockerfile, context=args.context, name=args.name
     )
-    print(f"built image {image.name!r} from {image.config.source} ({image.size_bytes / MIB:.0f} MiB)")
+    size_mib = image.size_bytes / BYTES_PER_MIB
+    print(f"built image {image.name!r} from {image.config.source} ({size_mib:.0f} MiB)")
     print(f"use it with: chronobox-mcp --image {image.name}")
 
 
@@ -38,7 +39,7 @@ def show_images(args: argparse.Namespace) -> None:
         return
     width = max(len(image.name) for image in images)
     for image in images:
-        print(f"{image.name:<{width}}  {image.size_bytes / MIB:>7.0f} MiB  {image.config.source}")
+        print(f"{image.name:<{width}}  {image.size_bytes / BYTES_PER_MIB:>7.0f} MiB  {image.config.source}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
