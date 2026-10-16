@@ -19,16 +19,22 @@ SERVER_ENV = dict(os.environ)
 
 
 async def text(session: ClientSession, tool: str, **arguments: object) -> str:
+    """The text of a tool call's result, as the agent would read it."""
     result = await session.call_tool(tool, arguments)
     return "".join(getattr(part, "text", "") for part in result.content)
 
 
 async def tool_names(session: ClientSession) -> set[str]:
+    """The names of the tools the server offers."""
     return {tool.name for tool in (await session.list_tools()).tools}
 
 
 async def test_profiles_expose_only_their_tools() -> None:
+    """Each profile offers exactly its tools: the profile is enforced by what exists, not only described in
+    the instructions."""
+
     async def call(method: str, *args: object) -> str:
+        """Stand-in for the workspace: tool listing never calls it."""
         return method
 
     expected = {
@@ -46,6 +52,8 @@ async def test_profiles_expose_only_their_tools() -> None:
 
 @pytest.mark.vm
 async def test_local_mode_forks_and_promotes(tmp_path: Path) -> None:
+    """Over real stdio in local mode, an agent can fork, change the fork, compare and promote it, and main
+    then has the fork's state."""
     params = StdioServerParameters(
         command=SERVER[0], args=[*SERVER[1:], "--root", str(tmp_path / "vms")], env=SERVER_ENV
     )
@@ -62,6 +70,8 @@ async def test_local_mode_forks_and_promotes(tmp_path: Path) -> None:
 
 @pytest.mark.vm
 async def test_served_machine_outlives_its_front_end(tmp_path: Path) -> None:
+    """A ``--serve`` machine keeps its state after a ``--connect`` front end exits, and the front end offers
+    only its profile's tools (no fork under rollback)."""
     socket = tmp_path / "machine.sock"
     serving = await asyncio.create_subprocess_exec(
         *SERVER, "--serve", str(socket), "--profile", "rollback", "--root", str(tmp_path / "vms")
@@ -91,6 +101,7 @@ async def test_served_machine_outlives_its_front_end(tmp_path: Path) -> None:
 
 @pytest.mark.vm
 async def test_setup_script_prepares_the_machine(tmp_path: Path) -> None:
+    """A ``--setup`` script runs in the machine before the agent's first command."""
     setup = tmp_path / "setup.sh"
     setup.write_text("echo ready > /root/prepared\n")
     params = StdioServerParameters(
@@ -104,5 +115,6 @@ async def test_setup_script_prepares_the_machine(tmp_path: Path) -> None:
 
 
 async def test_service_rejects_unknown_tools() -> None:
+    """Calling a method that is not a tool returns an error instead of reaching the workspace."""
     service = WorkspaceService(workspace=None)  # type: ignore[arg-type]
     assert (await service.call("rm_everything")).startswith("error: unknown tool")

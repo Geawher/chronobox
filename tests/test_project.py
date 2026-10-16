@@ -29,6 +29,7 @@ from chronobox.project import (
 
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
+    """A project with source files, a git folder and excluded folders (``node_modules``, ``data/cache``)."""
     root = tmp_path / "app"
     for relative in ("chronobox.toml", "main.py", "lib/util.py", "node_modules/x/index.js", ".git/HEAD"):
         (root / relative).parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +43,7 @@ def project(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def vm_dir(tmp_path: Path) -> Path:
+    """Stand-in VM files: Firecracker, kernel, tools drive and default image (contents irrelevant)."""
     vm = tmp_path / "vm"
     image_disk(vm, "default").parent.mkdir(parents=True)
     image_disk(vm, "default").write_bytes(b"image")
@@ -64,22 +66,27 @@ def vm_dir(tmp_path: Path) -> Path:
     ],
 )
 def test_exclusion_patterns(relative: str, excluded: bool) -> None:
+    """A pattern without a slash matches any path component, one with a slash a path and what is under it."""
     patterns = ("node_modules", "data/cache", "*.pyc")
     assert is_excluded(PurePosixPath(relative), patterns) is excluded
 
 
 def test_project_entries_skip_excluded_folders_and_git(project: Path) -> None:
+    """What is copied in leaves out excluded folders and ``.git``, but keeps the rest of ``data``."""
     entries = {str(entry) for entry in project_entries(load_config(project))}
     assert entries == {"chronobox.toml", "main.py", "lib", "lib/util.py", "data", "data/seed.sql"}
 
 
 def test_the_project_archive_holds_exactly_those_entries(project: Path) -> None:
+    """The archive copied into the machine holds exactly the project entries, nothing more."""
     with tarfile.open(fileobj=io.BytesIO(pack_project(load_config(project)))) as tar:
         names = set(tar.getnames())
     assert names == {"chronobox.toml", "main.py", "lib", "lib/util.py", "data", "data/seed.sql"}
 
 
 def test_warm_key_follows_project_files_but_not_excluded_ones(project: Path, vm_dir: Path) -> None:
+    """Editing a copied file changes the warm key; editing excluded files or exporting does not, so those
+    never cost a fresh boot."""
     config = load_config(project)
     first = warm_key(config, vm_dir)
     (project / "node_modules" / "x" / "index.js").write_text("changed")
@@ -91,6 +98,8 @@ def test_warm_key_follows_project_files_but_not_excluded_ones(project: Path, vm_
 
 @pytest.mark.parametrize("vm_file", ["firecracker", "vmlinux", TOOLS_DISK, "images/default/rootfs.ext4"])
 def test_warm_key_follows_every_vm_file(project: Path, vm_dir: Path, vm_file: str) -> None:
+    """A change to any VM file (Firecracker, kernel, tools drive, image) changes the warm key, so a snapshot
+    is never restored on files it was not made with."""
     config = load_config(project)
     first = warm_key(config, vm_dir)
     os.utime(vm_dir / vm_file, ns=(0, 1))
@@ -98,6 +107,8 @@ def test_warm_key_follows_every_vm_file(project: Path, vm_dir: Path, vm_file: st
 
 
 def test_a_service_loop_never_shows_the_service_command_in_its_own_command_line() -> None:
+    """The restart loop runs from a script, so ``pkill -f`` on the service command kills the service and not
+    the loop that restarts it."""
     service = Service(name="app", start="python3 app.py", env={"PORT": "8000"})
     command = service_command(service, "/src")
     assert command.endswith(
@@ -107,6 +118,7 @@ def test_a_service_loop_never_shows_the_service_command_in_its_own_command_line(
 
 
 def test_a_service_without_restart_runs_once() -> None:
+    """``restart = false`` starts the service once, in its own workdir."""
     command = service_command(Service(name="job", start="./run", restart=False, workdir="/opt"), "/src")
     assert "while" not in command and "cd /opt" in command
 
@@ -125,21 +137,28 @@ def test_a_service_without_restart_runs_once() -> None:
     ],
 )
 def test_patches_name_project_paths_but_leave_content_alone(line: str, renamed: str) -> None:
+    """Patch headers name project paths instead of the scratch folders, while content lines and real folders
+    called host are left alone."""
     assert _project_paths(line) == renamed
 
 
 @pytest.mark.parametrize("path", ["/../../etc", "/src/../../x", "src/app.py", "../x"])
 def test_export_refuses_paths_that_would_leave_the_exports_folder(tmp_path: Path, path: str) -> None:
+    """Relative paths and paths with ``..`` are refused, so an export can never delete or overwrite files
+    outside the exports folder."""
     with pytest.raises(ProjectError):
         _export_destination(tmp_path / "exports" / "main", path)
 
 
 def test_export_places_machine_paths_under_the_exports_folder(tmp_path: Path) -> None:
+    """A machine path lands at the same path under the exports folder."""
     exports = tmp_path / "exports" / "main"
     assert _export_destination(exports, "/src/app.py") == exports / "src" / "app.py"
 
 
 def test_a_patch_with_binary_files_odd_names_and_links_applies_with_git(tmp_path: Path) -> None:
+    """A patch with a binary file, non-ASCII and spaced names, and a symlink applies with ``git apply`` and
+    reproduces the machine's files exactly."""
     host, machine = tmp_path / "host", tmp_path / "machine"
     for side in (host, machine):
         (side / "my host").mkdir(parents=True)
@@ -157,6 +176,8 @@ def test_a_patch_with_binary_files_odd_names_and_links_applies_with_git(tmp_path
 
 
 def test_pruning_keeps_warm_starts_in_use_and_fresh_partial_ones(tmp_path: Path) -> None:
+    """Pruning deletes unused warm starts and stale partial ones, but never one a session borrows or a partial
+    one still being written."""
     project = tmp_path / "warm" / "project"
     keep, unused, in_use = project / "new", project / "old", project / "older"
     fresh_partial, stale_partial = project / f"a{PARTIAL_SUFFIX}", project / f"b{PARTIAL_SUFFIX}"
@@ -170,6 +191,7 @@ def test_pruning_keeps_warm_starts_in_use_and_fresh_partial_ones(tmp_path: Path)
 
 
 def test_a_patch_with_added_changed_and_deleted_files_applies_with_git(tmp_path: Path) -> None:
+    """A patch that adds, changes and deletes files applies with ``git apply``."""
     host, machine = tmp_path / "host", tmp_path / "machine"
     for side in (host, machine):
         (side / "lib").mkdir(parents=True)

@@ -27,6 +27,7 @@ class Location:
 
     @property
     def is_remote(self) -> bool:
+        """Whether this side is on a machine rather than on this computer."""
         return self.where is not None
 
 

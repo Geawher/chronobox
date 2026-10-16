@@ -10,11 +10,13 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "notes"
 
 
 def write(folder: Path, text: str) -> Path:
+    """Write ``text`` as the folder's chronobox.toml and return the folder."""
     (folder / "chronobox.toml").write_text(text)
     return folder
 
 
 def test_the_example_project_reads_as_written() -> None:
+    """The README's example project parses to the services, setup and excludes it declares."""
     config = load_config(EXAMPLE)
     assert config.path == EXAMPLE
     assert (config.image.name, config.target) == ("default", "/src")
@@ -25,12 +27,15 @@ def test_the_example_project_reads_as_written() -> None:
 
 
 def test_defaults_for_a_minimal_file(tmp_path: Path) -> None:
+    """An empty file is a valid config: default image, project here, copied to /src."""
     config = load_config(write(tmp_path, ""))
     assert (config.image.name, config.path, config.target) == ("default", tmp_path, "/src")
     assert (config.services, config.prepare, config.setup) == ((), (), ())
 
 
 def test_image_from_a_dockerfile_resolves_paths_from_the_file(tmp_path: Path) -> None:
+    """A Dockerfile path is relative to the config file; its folder is the default context and gives the image
+    its name."""
     (tmp_path / "docker").mkdir()
     config = load_config(write(tmp_path, 'image = { dockerfile = "docker/Dockerfile.dev" }\n'))
     assert config.image.dockerfile == tmp_path / "docker" / "Dockerfile.dev"
@@ -39,11 +44,13 @@ def test_image_from_a_dockerfile_resolves_paths_from_the_file(tmp_path: Path) ->
 
 
 def test_image_from_a_reference_gets_a_file_safe_name(tmp_path: Path) -> None:
+    """An image reference gets the same file-safe name ``chronobox build`` gives it."""
     config = load_config(write(tmp_path, 'image = { reference = "postgres:16" }\n'))
     assert (config.image.name, config.image.reference) == ("postgres-16", "postgres:16")
 
 
 def test_services_keep_their_options(tmp_path: Path) -> None:
+    """A service's env, restart and ready timeout are read as written, the workdir defaulting to empty."""
     text = """
 [[service]]
 name = "db"
@@ -78,10 +85,13 @@ ready_timeout = 30
     ],
 )
 def test_mistakes_are_reported_clearly(tmp_path: Path, text: str, message: str) -> None:
+    """Each kind of mistake (unknown keys, wrong types, ambiguous images, unsafe names) fails with a message
+    naming it, before anything boots."""
     with pytest.raises(ConfigError, match=message):
         load_config(write(tmp_path, text))
 
 
 def test_a_missing_file_says_where_it_looked(tmp_path: Path) -> None:
+    """A folder without chronobox.toml fails with a message saying so."""
     with pytest.raises(ConfigError, match="no chronobox.toml"):
         load_config(tmp_path)

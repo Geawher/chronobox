@@ -129,6 +129,11 @@ class Workspace:
         max_output: int = 6000,
         boot: Boot | None = None,
     ) -> None:
+        """Set up an empty workspace; ``start`` boots the main machine.
+
+        Raises:
+            ValueError: If ``guard`` is set without the chronobox profile.
+        """
         if guard and profile is not Profile.CHRONOBOX:
             raise ValueError("guard needs forks (profile chronobox)")
         self.backend = backend
@@ -150,6 +155,9 @@ class Workspace:
 
     # ---- lifecycle
     async def start(self) -> None:
+        """Boot the main machine and, unless the profile is alone, record it as the ``start`` checkpoint
+        (the boot's own snapshot when it has one, e.g. a warm start).
+        """
         booted = await self._boot() if self._boot else Booted(await self.backend.start(self.spec))
         self.main = booted.machine
         if self.profile is Profile.ALONE:
@@ -160,6 +168,7 @@ class Workspace:
             self.checkpoints[START] = Checkpoint(START, booted.snapshot, time.time(), "initial state")
 
     async def close(self) -> None:
+        """Stop the main machine and every fork; checkpoints stay with the backend until its cleanup."""
         machines = [self.main, *(fork.machine for fork in self.forks.values())]
         for machine in machines:
             if machine is not None:
@@ -196,6 +205,11 @@ class Workspace:
 
     # ---- checkpoints and rollback (profiles rollback, chronobox)
     async def checkpoint(self, label: str, note: str = "") -> str:
+        """Save the whole main machine under ``label``.
+
+        Raises:
+            WorkspaceError: If the profile has no checkpoints, or ``label`` is empty or already used.
+        """
         self._require(Profile.ROLLBACK, Profile.CHRONOBOX)
         label = _clean_label(label)
         if label in self.checkpoints:
@@ -205,12 +219,18 @@ class Workspace:
         return f"checkpoint {label!r} saved (whole machine: disk, memory, running processes)"
 
     def list_checkpoints(self) -> str:
+        """One entry per checkpoint (age, note, lessons, forks made from it), then the open forks."""
         lines = [self._describe_checkpoint(checkpoint) for checkpoint in self.checkpoints.values()]
         if self.forks:
             lines.append("forks: " + ", ".join(self.forks))
         return "\n".join(lines) or "no checkpoints"
 
     async def rollback(self, label: str, lesson: str = "") -> str:
+        """Replace the main machine with a restore of checkpoint ``label``, optionally recording a lesson.
+
+        Raises:
+            WorkspaceError: If the profile has no rollback or the checkpoint does not exist.
+        """
         self._require(Profile.ROLLBACK, Profile.CHRONOBOX)
         checkpoint = self._checkpoint_named(label)
         restored = await self.backend.restore(checkpoint.snapshot)
@@ -226,6 +246,14 @@ class Workspace:
 
     # ---- forks (profile chronobox)
     async def fork(self, name: str, from_checkpoint: str | None = None) -> str:
+        """Start an independent copy of the main machine (as it is now, or as ``from_checkpoint``).
+
+        A marker file touched in the fork at creation (``FORK_MARKER``) dates its changes: the
+        fork's report lists the files newer than it.
+
+        Raises:
+            WorkspaceError: If the profile has no forks, the name is taken or the checkpoint is unknown.
+        """
         self._require(Profile.CHRONOBOX)
         name = _clean_label(name)
         if name in self.forks or name == MAIN:
@@ -253,6 +281,11 @@ class Workspace:
         return await self._fork_report(self._fork(name), closing=False)
 
     async def compare(self, command: str, forks: list[str] | None = None) -> str:
+        """Run ``command`` on main and on ``forks`` (default: all) and show the outputs side by side.
+
+        Raises:
+            WorkspaceError: If the profile has no forks or a named fork does not exist.
+        """
         self._require(Profile.CHRONOBOX)
         targets = [MAIN, *(forks or list(self.forks))]
         parts = []
@@ -263,6 +296,11 @@ class Workspace:
         return "\n".join(parts)
 
     async def promote(self, name: str) -> str:
+        """Make a fork the main machine, after checkpointing the old main as ``before-promote-<name>``.
+
+        Raises:
+            WorkspaceError: If the profile has no forks or the fork does not exist.
+        """
         self._require(Profile.CHRONOBOX)
         fork = self._fork(name)
         report = await self._fork_report(fork, closing=False)
@@ -280,6 +318,11 @@ class Workspace:
         )
 
     async def discard(self, name: str, lesson: str = "") -> str:
+        """Stop a fork and return its report; record ``lesson``, or an automatic one if commands failed.
+
+        Raises:
+            WorkspaceError: If the profile has no forks or the fork does not exist.
+        """
         self._require(Profile.CHRONOBOX)
         fork = self._fork(name)
         report = await self._fork_report(fork, closing=True)
@@ -299,22 +342,28 @@ class Workspace:
 
     # ---- helpers
     def _guard_refuses(self, command: str, force: bool) -> bool:
+        """Whether the guard blocks ``command`` on main: destructive, not forced, and not yet run
+        successfully on a fork.
+        """
         if not self.guard or force or not commands.needs_rehearsal(command):
             return False
         return commands.normalize(command) not in self._rehearsed
 
     async def _auto_checkpoint(self, command: str) -> str:
+        """Checkpoint main before a risky command; returns the notice put before its output."""
         self._auto_checkpoints += 1
         label = f"auto-{self._auto_checkpoints}"
         await self._save_checkpoint(label, f"before: {command[:80]}")
         return f"[chronobox: checkpoint {label!r} saved automatically before this command]\n"
 
     def _note_fork_command(self, fork: Fork, command: str, code: int) -> None:
+        """Record a fork's command; a successful destructive one counts as rehearsed for the guard."""
         fork.commands.append((command, code))
         if code == 0 and commands.needs_rehearsal(command):
             self._rehearsed.add(commands.normalize(command))
 
     async def _replace_main(self, machine: Machine) -> None:
+        """Swap in a new main machine, stop the old one, and notify the listeners around the switch."""
         for listener in self.before_main_switch:
             await listener()
         previous, self.main = self.main, machine
@@ -324,10 +373,20 @@ class Workspace:
             await listener()
 
     async def _save_checkpoint(self, label: str, note: str) -> None:
+        """Snapshot the main machine and keep it under ``label`` (replacing any checkpoint of that name)."""
         snapshot = await self.backend.snapshot(self._machine(MAIN))
         self.checkpoints[label] = Checkpoint(label, snapshot, time.time(), note)
 
     async def _fork_report(self, fork: Fork, *, closing: bool) -> str:
+        """What a fork did: its state-changing commands, failures and changed files.
+
+        Args:
+            fork: The fork to report on.
+            closing: The fork is being discarded: remind the agent that main is unchanged.
+
+        Returns:
+            The report, one item per line.
+        """
         lines = [
             f"Report from fork {fork.name!r} (started from {fork.origin!r}, {len(fork.commands)} commands):"
         ]
@@ -352,6 +411,7 @@ class Workspace:
         return "\n".join(lines)
 
     def _describe_checkpoint(self, checkpoint: Checkpoint) -> str:
+        """A checkpoint's line for ``list_checkpoints``, with its lessons and open forks."""
         age = time.time() - checkpoint.created
         note = f": {checkpoint.note}" if checkpoint.note else ""
         lines = [f"- {checkpoint.label} ({age:.0f}s ago){note}"]
@@ -364,11 +424,13 @@ class Workspace:
         return "\n".join(lines)
 
     def _add_lesson(self, text: str, source: str, checkpoint: str) -> None:
+        """Keep a lesson, attached to its checkpoint so later forks and rollbacks there show it."""
         self.lessons.append(Lesson(text, source, checkpoint))
         if checkpoint in self.checkpoints:
             self.checkpoints[checkpoint].lessons.append(text)
 
     def _lessons_text(self, label: str) -> str:
+        """Lessons to show when arriving at checkpoint ``label``: all from it, the last few from elsewhere."""
         if not self.lessons:
             return ""
         here = [lesson for lesson in self.lessons if lesson.checkpoint == label]
@@ -390,6 +452,11 @@ class Workspace:
         return self._machine(where)
 
     def _machine(self, where: str) -> Machine:
+        """The main machine or a fork's.
+
+        Raises:
+            WorkspaceError: If the workspace is not started or the fork does not exist.
+        """
         if where != MAIN:
             return self._fork(where).machine
         if self.main is None:
@@ -397,6 +464,11 @@ class Workspace:
         return self.main
 
     def _fork(self, name: str) -> Fork:
+        """The open fork called ``name``.
+
+        Raises:
+            WorkspaceError: If the profile has no forks or there is no such fork.
+        """
         if self.profile is not Profile.CHRONOBOX:
             raise WorkspaceError("forks are not available in this profile")
         try:
@@ -405,6 +477,11 @@ class Workspace:
             raise WorkspaceError(f"no fork named {name!r}; forks: {list(self.forks)}") from None
 
     def _checkpoint_named(self, label: str) -> Checkpoint:
+        """The checkpoint called ``label``.
+
+        Raises:
+            WorkspaceError: If there is none.
+        """
         try:
             return self.checkpoints[label]
         except KeyError:
@@ -413,17 +490,29 @@ class Workspace:
             ) from None
 
     def _require(self, *profiles: Profile) -> None:
+        """Refuse a tool the current profile does not offer.
+
+        Raises:
+            WorkspaceError: If the profile is not one of ``profiles``.
+        """
         if self.profile not in profiles:
             raise WorkspaceError(f"not available in profile {self.profile.value!r}")
 
     def _format(self, output: str, code: int) -> str:
+        """Command output, shortened to ``max_output``, followed by its exit code."""
         return f"{_shorten(output, self.max_output)}[exit code {code}]"
 
     def _log(self, kind: str, **details: Any) -> None:
+        """Append an event (with a timestamp) to ``events``, the record harnesses read."""
         self.events.append({"t": round(time.time(), 2), "event": kind, **details})
 
 
 def _clean_label(label: str) -> str:
+    """A label safe for checkpoint and fork names: other characters become ``-``, length is capped.
+
+    Raises:
+        WorkspaceError: If nothing is left.
+    """
     label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label.strip())[:MAX_LABEL_LENGTH]
     if not label:
         raise WorkspaceError("label must not be empty")
@@ -439,6 +528,7 @@ def _shorten(text: str, limit: int) -> str:
 
 
 def _shorten_list(items: list[str]) -> str:
+    """The first few items, comma-separated, with a count of the rest."""
     shown = ", ".join(items[:REPORT_MAX_FILES])
     hidden = len(items) - REPORT_MAX_FILES
     return f"{shown} (+{hidden} more)" if hidden > 0 else shown

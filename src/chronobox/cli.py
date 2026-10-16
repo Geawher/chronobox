@@ -38,6 +38,7 @@ MAX_SOCKET_PATH = 107  # bytes in sockaddr_un.sun_path, without the final NUL
 
 
 def build(args: argparse.Namespace) -> None:
+    """``chronobox build``: the tools drive, an image from a reference or Dockerfile, or a project's image."""
     if args.tools:
         print(f"built the tools drive: {build_tools(args.vm_dir)}")
         return
@@ -77,6 +78,7 @@ def build_project_image(vm_dir: Path, source: ImageSource) -> Image:
 
 
 def show_images(args: argparse.Namespace) -> None:
+    """``chronobox images``: one line per built image with its size and source."""
     images = list_images(args.vm_dir)
     if not images:
         print(f"no images in {args.vm_dir}; build one with `chronobox build`")
@@ -87,6 +89,7 @@ def show_images(args: argparse.Namespace) -> None:
 
 
 def warm(args: argparse.Namespace) -> None:
+    """``chronobox warm``: make sure the project's warm start exists and say how long starting took."""
     config = load_config(args.project)
     boot = asyncio.run(prepare_warm_start(config, args.vm_dir))
     if boot.was_warm:
@@ -114,6 +117,11 @@ async def prepare_warm_start(config: ProjectConfig, vm_dir: Path) -> ProjectBoot
 
 
 def up(args: argparse.Namespace) -> None:
+    """``chronobox up``: serve the project's machine on its socket until Ctrl-C or ``chronobox down``.
+
+    Raises:
+        ServiceError: If the socket path is too long for a unix socket, or the project is already up.
+    """
     config = load_config(args.project)
     socket_path = up_socket(config)
     if len(os.fsencode(socket_path)) > MAX_SOCKET_PATH:
@@ -136,6 +144,11 @@ def up(args: argparse.Namespace) -> None:
 
 
 def down(args: argparse.Namespace) -> None:
+    """``chronobox down``: ask the project's ``up`` machine to shut down.
+
+    Raises:
+        ServiceError: If no machine is up for the project.
+    """
     config = load_config(args.project)
     socket_path = asyncio.run(running_machine(config))
     asyncio.run(request(socket_path, {"op": Op.SHUTDOWN}))
@@ -143,6 +156,12 @@ def down(args: argparse.Namespace) -> None:
 
 
 def copy(args: argparse.Namespace) -> None:
+    """``chronobox cp``: copy between here and the ``up`` machine (main or a fork), in either direction.
+
+    Raises:
+        CopyError: If both or neither sides are on the machine, or a local side is unusable.
+        ServiceError: If no machine is up, or the machine refuses the copy.
+    """
     source, destination = parse_location(args.source), parse_location(args.destination)
     check_direction(source, destination)
     socket_path = asyncio.run(running_machine(load_config(args.project)))
@@ -169,11 +188,13 @@ async def running_machine(config: ProjectConfig) -> Path:
 
 
 def serve_mcp(args: argparse.Namespace) -> None:
+    """``chronobox mcp``: run the MCP server with the remaining options, on this command's VM files."""
     os.environ["CHRONOBOX_VM_DIR"] = str(args.vm_dir)
     server.main(args.server_args)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the command line; options after ``mcp`` are left in ``server_args`` for the server."""
     parser = argparse.ArgumentParser(prog="chronobox", description=__doc__.splitlines()[0])
     parser.add_argument(
         "--vm-dir", type=Path, default=default_vm_dir(), help="where the VM files live (CHRONOBOX_VM_DIR)"
@@ -222,6 +243,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Run a ``chronobox`` command; expected failures exit with a one-line message, not a traceback."""
     args = parse_args(argv)
     try:
         args.handler(args)

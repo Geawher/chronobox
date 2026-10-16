@@ -76,6 +76,7 @@ def cache_dir() -> Path:
 
 
 def default_warm_dir() -> Path:
+    """``<cache>/warm``: each warm snapshot is in ``<project id>/<warm key>`` under it."""
     return cache_dir() / "warm"
 
 
@@ -99,6 +100,7 @@ def up_socket(config: ProjectConfig) -> Path:
 
 
 def machine_spec(config: ProjectConfig) -> MachineSpec:
+    """The machine a project runs on: its image and the ``[machine]`` sizes."""
     return MachineSpec(
         image=config.image.name,
         mem_mib=config.mem_mib,
@@ -136,6 +138,7 @@ def project_entries(config: ProjectConfig) -> Iterator[PurePosixPath]:
 
 
 def pack_project(config: ProjectConfig) -> bytes:
+    """A tar archive of the project's files as they go into the machine (excludes left out)."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
         for relative in project_entries(config):
@@ -198,6 +201,7 @@ class ProjectBoot:
     """
 
     def __init__(self, backend: FirecrackerBackend, config: ProjectConfig, warm_dir: Path | None) -> None:
+        """Set up the boot; nothing starts until it is called."""
         self.backend = backend
         self.config = config
         self.warm_dir = warm_dir
@@ -206,6 +210,8 @@ class ProjectBoot:
         self.baseline = backend.root / BASELINE
 
     async def __call__(self) -> Booted:
+        """Start the main machine, warm if a matching warm snapshot exists; ``seconds`` records
+        how long it took."""
         started = time.monotonic()
         warm = self._warm_path()
         booted = await self._from_warm(warm) if warm is not None else None
@@ -215,6 +221,11 @@ class ProjectBoot:
         return booted
 
     async def _from_warm(self, warm: Path) -> Booted | None:
+        """Restore the warm snapshot at ``warm``, or ``None`` to boot fresh instead.
+
+        The snapshot stays borrowed (held in use) as the start checkpoint. One this VM cannot load is
+        deleted, so the next session does not fail on it too.
+        """
         if not (warm / WARM_COMPLETE).exists():
             return None
         try:
@@ -235,6 +246,12 @@ class ProjectBoot:
         return Booted(machine, snapshot)
 
     async def _fresh(self, warm: Path | None) -> Booted:
+        """Boot a new machine and prepare the project in it, then save it as ``warm`` if given.
+
+        Raises:
+            VMError: If the machine does not boot or a prepare, service or setup step fails (the
+                machine is stopped).
+        """
         machine = await self.backend.start(machine_spec(self.config))
         try:
             await self._prepare(machine)
@@ -246,6 +263,12 @@ class ProjectBoot:
         return Booted(machine)
 
     async def _prepare(self, machine: Machine) -> None:
+        """Copy the project in (keeping the archive as the diff baseline), run ``prepare``, start
+        each service and wait until it is ready, then run ``setup``.
+
+        Raises:
+            VMError: If any step fails.
+        """
         config = self.config
         archive = await asyncio.to_thread(pack_project, config)
         self.baseline.write_bytes(archive)
@@ -261,6 +284,8 @@ class ProjectBoot:
         await _check(machine, f"cd {shlex.quote(config.target)}", "enter the project")
 
     def _warm_path(self) -> Path | None:
+        """This project's warm snapshot folder for its current files and VM; ``None`` without
+        warm starts."""
         if self.warm_dir is None:
             return None
         return self.warm_dir / project_id(self.config) / warm_key(self.config, self.backend.vm_dir)
@@ -299,6 +324,7 @@ def _prune_warm(keep: Path) -> None:
 
 
 def _prune_one(entry: Path) -> None:
+    """Delete a warm snapshot no session borrows, or a partial one old enough to be a crash's leftover."""
     if entry.name.endswith(PARTIAL_SUFFIX):
         if time.time() - entry.stat().st_mtime > STALE_PARTIAL_S:
             shutil.rmtree(entry, ignore_errors=True)
@@ -370,6 +396,7 @@ def project_tools(workspace: Workspace, boot: ProjectBoot) -> dict[str, Method]:
     config = boot.config
 
     async def diff(where: str = MAIN) -> str:
+        """The ``diff`` tool: a patch of the project on ``where``; failures come back as ``error: ...``."""
         try:
             baseline = await asyncio.to_thread(boot.baseline.read_bytes)
             patch = await project_diff(workspace.machine(where), config, baseline)
@@ -378,6 +405,8 @@ def project_tools(workspace: Workspace, boot: ProjectBoot) -> dict[str, Method]:
         return patch or f"no changes: {config.target} on {where} matches the project as copied in"
 
     async def export_path(path: str, where: str = MAIN) -> str:
+        """The ``export`` tool: copy ``path`` from ``where`` into the exports folder; failures
+        come back as ``error: ...``."""
         try:
             destination = await export(workspace.machine(where), config, path, where)
         except (VMError, ProjectError, tarfile.TarError, OSError) as error:
@@ -399,6 +428,11 @@ def project_note(config: ProjectConfig) -> str:
 
 
 async def _check(machine: Machine, command: str, step: str) -> str:
+    """Run ``command`` on the machine and return its output.
+
+    Raises:
+        VMError: If it exits non-zero; the message names ``step`` and ends with the output.
+    """
     code, output = await machine.run(command)
     if code != 0:
         raise VMError(f"{step} failed ({code}): {command}\n{output[-1500:]}")
@@ -406,6 +440,11 @@ async def _check(machine: Machine, command: str, step: str) -> str:
 
 
 async def _wait_ready(machine: Machine, service: Service) -> None:
+    """Poll the service's ``ready`` command (isolated) until it succeeds.
+
+    Raises:
+        VMError: If it is not ready within its ``ready_timeout``; the message ends with the tail of its log.
+    """
     if not service.ready:
         return
     deadline = time.monotonic() + service.ready_timeout
@@ -436,12 +475,15 @@ def _unpack_for_diff(archive: bytes, destination: Path) -> None:
 
 
 def _keep_links_skip_special(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo | None:
+    """Tar filter for diffs: device files and FIFOs are skipped; the rest goes through tar's ``tar``
+    filter, which keeps every member inside the destination but leaves links as they are."""
     if member.type in SPECIAL_FILES:
         return None
     return tarfile.tar_filter(member, destination)
 
 
 def _holds_a_folder(archive: bytes) -> bool:
+    """Whether the archive is a folder's content (``./...``) rather than one file under its name."""
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         return any(member.name == "." or member.name.startswith("./") for member in tar.getmembers())
 

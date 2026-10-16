@@ -174,6 +174,7 @@ def load_config(project: Path) -> ProjectConfig:
 
 
 def _image(value: Any, base: Path) -> ImageSource:
+    """The image source, with its name checked as an image name."""
     source = _image_source(value, base)
     try:
         check_image_name(source.name)
@@ -183,6 +184,15 @@ def _image(value: Any, base: Path) -> ImageSource:
 
 
 def _image_source(value: Any, base: Path) -> ImageSource:
+    """Read ``image``: a built image's name, or a table with a ``reference`` or a ``dockerfile``.
+
+    Args:
+        value: The raw ``image`` value.
+        base: The config file's folder; ``dockerfile`` and ``context`` are relative to it.
+
+    Raises:
+        ConfigError: If it is neither a name nor a table, or the table has not exactly one source.
+    """
     if isinstance(value, str):
         return ImageSource(name=value)
     if not isinstance(value, dict):
@@ -200,6 +210,12 @@ def _image_source(value: Any, base: Path) -> ImageSource:
 
 
 def _service(entry: dict[str, Any]) -> Service:
+    """Read one ``[[service]]`` table.
+
+    Raises:
+        ConfigError: If it has unknown keys, no name or start command, a name that would need
+            quoting, or env values or names that are not plain strings and variable names.
+    """
     _check_keys(entry, SERVICE_KEYS, "service")
     if not entry.get("name") or not entry.get("start"):
         raise ConfigError(f"every service needs a name and a start command: {entry}")
@@ -223,6 +239,7 @@ def _service(entry: dict[str, Any]) -> Service:
 
 
 def _table(raw: dict[str, Any], key: str, allowed: frozenset[str]) -> dict[str, Any]:
+    """The table under ``key`` (empty if absent), checked for unknown keys."""
     table = raw.get(key, {})
     if not isinstance(table, dict):
         raise ConfigError(f"{key} must be a table")
@@ -231,6 +248,7 @@ def _table(raw: dict[str, Any], key: str, allowed: frozenset[str]) -> dict[str, 
 
 
 def _list(raw: dict[str, Any], key: str, kind: type) -> list[Any]:
+    """The list under ``key`` (empty if absent), checked to hold only ``kind`` items."""
     items = raw.get(key, [])
     if not isinstance(items, list) or not all(isinstance(item, kind) for item in items):
         raise ConfigError(f"{key} must be a list of {kind.__name__}")
@@ -238,6 +256,7 @@ def _list(raw: dict[str, Any], key: str, kind: type) -> list[Any]:
 
 
 def _check_keys(table: dict[str, Any], allowed: frozenset[str], where: str) -> None:
+    """Raise a ``ConfigError`` naming the keys of ``table`` that are not ``allowed``."""
     unknown = sorted(set(table) - allowed)
     if unknown:
         allowed_keys = ", ".join(sorted(allowed))
@@ -245,6 +264,7 @@ def _check_keys(table: dict[str, Any], allowed: frozenset[str], where: str) -> N
 
 
 def _absolute(path: str, key: str) -> str:
+    """An absolute path in the machine without a trailing slash; ``key`` names it in the error."""
     if not path.startswith("/"):
         raise ConfigError(f"{key} must be an absolute path in the machine: {path!r}")
     return path.rstrip("/") or "/"

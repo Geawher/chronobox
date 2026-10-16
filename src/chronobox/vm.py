@@ -124,6 +124,7 @@ class Machine:
     """A running VM; run shell commands in it as root."""
 
     def __init__(self, workdir: Path, spec: MachineSpec) -> None:
+        """A machine in ``workdir`` (its disks, sockets and log); not started yet."""
         self.workdir = workdir
         self.spec = spec
         self.process: subprocess.Popen[bytes] | None = None
@@ -134,6 +135,7 @@ class Machine:
 
     @property
     def api_socket(self) -> Path:
+        """Firecracker's API socket, through the short link."""
         return self.link / "api.sock"
 
     async def run(
@@ -187,6 +189,7 @@ class Machine:
         _raise_for(reply, "clock")
 
     async def close(self) -> None:
+        """Kill the VM and delete its folder (a snapshot of it lives elsewhere)."""
         if self.process is not None and self.process.poll() is None:
             self.process.kill()
             await asyncio.to_thread(self.process.wait)
@@ -194,6 +197,12 @@ class Machine:
         shutil.rmtree(self.workdir, ignore_errors=True)
 
     async def wait_ready(self) -> None:
+        """Wait until the guest agent answers a ping.
+
+        Raises:
+            VMError: If Firecracker exits or the agent does not answer within ``READY_TIMEOUT_S``,
+                with the end of the VM's log.
+        """
         deadline = time.monotonic() + READY_TIMEOUT_S
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:
@@ -206,10 +215,12 @@ class Machine:
         raise VMError(f"guest agent not ready after {READY_TIMEOUT_S:g}s: {self.log_tail()}")
 
     def log_tail(self) -> str:
+        """The end of Firecracker's log (kernel console included), for error messages."""
         log = self.workdir / "firecracker.log"
         return log.read_text(errors="replace")[-1500:] if log.exists() else ""
 
     async def _guest(self, request: dict[str, object], timeout: float) -> dict[str, object]:
+        """A request to the guest agent that carries no bytes either way; its reply line."""
         reply, _ = await self._exchange(request, timeout)
         return reply
 
@@ -239,6 +250,12 @@ class FirecrackerBackend:
     """Starts, snapshots and restores machines under ``root`` (deleted by ``cleanup``)."""
 
     def __init__(self, root: Path | None = None, vm_dir: Path | None = None) -> None:
+        """Use the VM files in ``vm_dir`` (default: ``default_vm_dir()``) and keep machines and
+        snapshots under ``root`` (default: a new folder under ``runs/vms``).
+
+        Raises:
+            VMError: If Firecracker, the kernel or the tools drive is missing.
+        """
         self.vm_dir = vm_dir or default_vm_dir()
         missing = [name for name in VM_FILES if not (self.vm_dir / name).exists()]
         if missing:
@@ -328,6 +345,8 @@ class FirecrackerBackend:
         return Snapshot(key)
 
     async def _snapshot_into(self, machine: Machine, store: Path) -> None:
+        """Pause the machine, write its memory, device state and data disk into ``store`` with
+        links to its tools and image disks, then resume it (even if saving failed)."""
         started = time.monotonic()
         await _api(machine.api_socket, "PATCH", "/vm", {"state": "Paused"})
         try:
@@ -345,6 +364,11 @@ class FirecrackerBackend:
         self.stats.snapshot_seconds += time.monotonic() - started
 
     async def _restore_from(self, store: Path, spec: MachineSpec) -> Machine:
+        """A new running machine from the snapshot files in ``store``, on the disks linked there.
+
+        Raises:
+            VMError: If Firecracker cannot load the snapshot or the agent does not answer.
+        """
         started = time.monotonic()
         machine = self._new_machine(spec, store)
         await asyncio.to_thread(_sparse_copy, store / DATA_DISK, machine.workdir / DATA_DISK)
@@ -360,6 +384,7 @@ class FirecrackerBackend:
         return machine
 
     async def release(self, snapshot: Snapshot) -> None:
+        """Forget a snapshot: delete its files, or for a borrowed one only drop its in-use lock."""
         self._specs.pop(snapshot.key, None)
         store = self._stores.pop(snapshot.key, None)
         if snapshot.key in self._borrowed:
@@ -368,6 +393,7 @@ class FirecrackerBackend:
             shutil.rmtree(store, ignore_errors=True)
 
     async def stop(self, machine: Machine) -> None:
+        """Kill a machine and delete its folder."""
         await self._close(machine)
 
     async def cleanup(self) -> None:
@@ -380,10 +406,12 @@ class FirecrackerBackend:
         shutil.rmtree(self.root, ignore_errors=True)
 
     async def _close(self, machine: Machine) -> None:
+        """Stop tracking a machine and close it."""
         self._live.discard(machine)
         await machine.close()
 
     async def _configure_and_boot(self, machine: Machine) -> None:
+        """Give a launched Firecracker its kernel, the three drives, memory and vsock, and boot it."""
         spec = machine.spec
         api = machine.api_socket
         await _api(api, "PUT", "/boot-source", {"kernel_image_path": "vmlinux", "boot_args": BOOT_ARGS})
@@ -411,6 +439,11 @@ class FirecrackerBackend:
         return machine
 
     async def _launch(self, machine: Machine) -> None:
+        """Start the Firecracker process of a machine and wait for its API socket.
+
+        Raises:
+            VMError: If the API socket does not appear within ``API_SOCKET_WAIT_S``.
+        """
         # Launch from the event-loop thread: the death signal is tied to the launching
         # thread, and this one lives as long as the process.
         with open(machine.workdir / "firecracker.log", "wb") as log:
@@ -429,6 +462,8 @@ class FirecrackerBackend:
             await asyncio.sleep(0.01)
 
     def _make_data_disk(self, path: Path, size_mib: int) -> None:
+        """An empty ext4 data disk of ``size_mib`` MiB at ``path``, copied sparse from a template
+        formatted once per size."""
         template = self.root / f"data-template-{size_mib}.ext4"
         if not template.exists():
             with open(template, "wb") as disk:
@@ -467,6 +502,11 @@ async def _api(socket_path: Path, method: str, path: str, body: dict[str, object
 
 
 def _raise_for(reply: dict[str, object], action: str) -> None:
+    """Raise the guest agent's error, if its reply has one.
+
+    Raises:
+        VMError: Naming ``action`` and the agent's message.
+    """
     if "error" in reply:
         raise VMError(f"{action}: {reply['error']}")
 
@@ -501,4 +541,5 @@ def _link_disk(disk: Path, link: Path) -> None:
 
 
 def _sparse_copy(source: Path, target: Path) -> None:
+    """Copy a disk without writing its holes, so a mostly empty disk costs little space and time."""
     subprocess.run(["cp", "--sparse=always", str(source), str(target)], check=True)

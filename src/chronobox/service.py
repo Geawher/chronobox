@@ -55,6 +55,7 @@ class WorkspaceService:
     """Boots a workspace in the background and answers requests about it."""
 
     def __init__(self, workspace: Workspace) -> None:
+        """Prepare to serve ``workspace``; call ``boot`` to start its machine."""
         self.workspace = workspace
         self.ready = asyncio.Event()
         self.stopped = asyncio.Event()
@@ -89,10 +90,13 @@ class WorkspaceService:
             return f"error: {error}"
 
     async def serve(self, socket_path: Path) -> asyncio.Server:
+        """Listen on ``socket_path`` (replacing a leftover socket file) until the server is closed."""
         socket_path.unlink(missing_ok=True)
         return await asyncio.start_unix_server(self._handle, path=str(socket_path), limit=STREAM_LIMIT)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Answer one connection: a request line (plus a tar archive for ``put``), then one reply
+        line (plus a tar archive for ``get``); malformed requests get an ``error`` reply."""
         payload = b""
         try:
             request = json.loads(await reader.readline())
@@ -109,6 +113,7 @@ class WorkspaceService:
         writer.close()
 
     async def _put(self, request: dict[str, Any], archive: bytes) -> dict[str, Any]:
+        """Unpack a request's archive on the machine it names; failures become an ``error`` reply."""
         try:
             await (await self._machine(request)).put(request["path"], archive)
         except (WorkspaceError, VMError, OSError, ValueError) as error:  # OSError: guest timeouts
@@ -116,6 +121,7 @@ class WorkspaceService:
         return {"ok": True}
 
     async def _get(self, request: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+        """A tar archive of the path a request names, with its reply; failures become an ``error`` reply."""
         try:
             archive = await (await self._machine(request)).get(request["path"])
         except (WorkspaceError, VMError, OSError, ValueError) as error:  # OSError: guest timeouts
@@ -134,6 +140,8 @@ class WorkspaceService:
         return self.workspace.machine(request.get("where", MAIN))
 
     async def _answer(self, request: dict[str, Any]) -> dict[str, Any]:
+        """The reply to a request without a payload (``call``, ``ping``, ``status``, ``shutdown``
+        or an extra op); an unknown op gets an ``error`` reply."""
         op = request["op"]
         if op == Op.CALL:
             return {"result": await self.call(request["method"], *request.get("args", []))}
@@ -180,6 +188,11 @@ async def get_remote(socket_path: Path | str, where: str, path: str) -> bytes:
 
 
 async def _transfer(socket_path: Path | str, request: dict[str, Any], archive: bytes) -> bytes:
+    """Send a request line and ``archive``; return the archive the reply carries (empty if none).
+
+    Raises:
+        ServiceError: If the service is not reachable or replies with an error.
+    """
     try:
         reader, writer = await asyncio.open_unix_connection(str(socket_path), limit=STREAM_LIMIT)
         writer.write((json.dumps(request) + "\n").encode() + archive)
@@ -204,6 +217,7 @@ async def is_serving(socket_path: Path) -> bool:
 
 
 async def call_remote(socket_path: Path | str, method: str, *args: Any) -> str:
+    """Call a tool on a served workspace; failures come back as ``error: ...`` text, like the tools'."""
     try:
         reply = await request(socket_path, {"op": Op.CALL, "method": method, "args": list(args)})
     except OSError as error:

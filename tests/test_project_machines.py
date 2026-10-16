@@ -37,18 +37,21 @@ NODE = "node-22-alpine"
 
 @pytest.fixture
 def project(tmp_path: Path) -> ProjectConfig:
+    """A copy of the example notes project, so tests can edit its files."""
     shutil.copytree(EXAMPLE, tmp_path / "notes")
     return load_config(tmp_path / "notes")
 
 
 @pytest.fixture
 async def backend(tmp_path: Path) -> AsyncIterator[FirecrackerBackend]:
+    """A backend whose VMs and snapshots are deleted after the test."""
     backend = FirecrackerBackend(tmp_path / "vms")
     yield backend
     await backend.cleanup()
 
 
 async def output(workspace: Workspace, command: str, where: str = MAIN) -> str:
+    """A command's output, straight from the machine (no workspace markers)."""
     _, text = await workspace.machine(where).run(command)
     return text.strip()
 
@@ -56,6 +59,7 @@ async def output(workspace: Workspace, command: str, where: str = MAIN) -> str:
 async def start(
     backend: FirecrackerBackend, project: ProjectConfig, warm_dir: Path | None
 ) -> tuple[Workspace, ProjectBoot]:
+    """Start the project's workspace (warm if ``warm_dir`` has a match); returns it and its boot."""
     boot = ProjectBoot(backend, project, warm_dir)
     workspace = Workspace(backend, machine_spec(project), boot=boot)
     await workspace.start()
@@ -63,6 +67,8 @@ async def start(
 
 
 async def test_project_comes_up_then_starts_warm(project: ProjectConfig, tmp_path: Path) -> None:
+    """The first session prepares the project, the second restores the warm start quickly; both serve the
+    notes with the host's time, and a rollback to start brings a deleted project back."""
     for session in ("first", "second"):
         backend = FirecrackerBackend(tmp_path / f"vms-{session}")
         try:
@@ -89,6 +95,8 @@ async def test_project_comes_up_then_starts_warm(project: ProjectConfig, tmp_pat
 async def test_a_change_on_a_fork_comes_back_as_a_patch(
     project: ProjectConfig, backend: FirecrackerBackend, tmp_path: Path
 ) -> None:
+    """A fork's edit comes back as a patch that ``git apply`` takes, without a local edit made meanwhile; main
+    has no changes, and ``export`` copies the fork's file under the exports folder."""
     workspace, boot = await start(backend, project, tmp_path / "warm")
     baseline = boot.baseline.read_bytes()
     await workspace.fork("newest-first")
@@ -110,6 +118,7 @@ async def test_a_change_on_a_fork_comes_back_as_a_patch(
 async def test_a_killed_service_is_restarted_by_its_loop(
     project: ProjectConfig, backend: FirecrackerBackend, tmp_path: Path
 ) -> None:
+    """A killed service is restarted by its loop and serves again, with the exit in its log."""
     workspace, _ = await start(backend, project, None)
     await workspace.run("pkill -f 'python3 app.py'; sleep 3")
     assert "buy milk" in await output(workspace, NOTES)
@@ -119,6 +128,7 @@ async def test_a_killed_service_is_restarted_by_its_loop(
 async def test_a_service_that_never_gets_ready_fails_the_boot_with_its_log(
     project: ProjectConfig, backend: FirecrackerBackend
 ) -> None:
+    """A service whose ready check never passes fails the boot with a clear message."""
     db, app = project.services
     never_ready = replace(project, services=(db, replace(app, ready="false", ready_timeout=3.0)))
     with pytest.raises(VMError, match="service app not ready"):
@@ -127,6 +137,8 @@ async def test_a_service_that_never_gets_ready_fails_the_boot_with_its_log(
 
 @pytest.mark.skipif(not image_disk(default_vm_dir(), NODE).exists(), reason=f"image {NODE} not built")
 async def test_files_move_in_and_out_of_an_image_without_tar(backend: FirecrackerBackend) -> None:
+    """Files move in and out of an image that has no tar, links resolve inside the image, and a missing path
+    fails clearly."""
     machine = await backend.start(MachineSpec(image=NODE, mem_mib=256))
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
@@ -146,6 +158,7 @@ async def test_files_move_in_and_out_of_an_image_without_tar(backend: Firecracke
 async def test_the_mcp_server_serves_a_project_with_diff_and_export(
     project: ProjectConfig, tmp_path: Path
 ) -> None:
+    """``chronobox-mcp --project`` tells the agent where the project is and offers ``diff`` and ``export``."""
     server = [sys.executable, "-m", "chronobox.server", "--project", str(project.path), "--no-warm"]
     params = StdioServerParameters(
         command=server[0], args=[*server[1:], "--root", str(tmp_path / "vms")], env=dict(os.environ)
@@ -160,10 +173,12 @@ async def test_the_mcp_server_serves_a_project_with_diff_and_export(
 
 
 def text_of(result: CallToolResult) -> str:
+    """The text of a tool call's result, as the agent would read it."""
     return "".join(getattr(part, "text", "") for part in result.content)
 
 
 def chronobox(command: str, project: ProjectConfig, *args: str, env: dict[str, str]) -> CompletedProcess[str]:
+    """Run a ``chronobox`` project command for ``project`` and capture its output."""
     argv = [sys.executable, "-m", "chronobox.cli", command, "--project", str(project.path), *args]
     return subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
 
@@ -171,6 +186,8 @@ def chronobox(command: str, project: ProjectConfig, *args: str, env: dict[str, s
 async def test_up_shares_one_machine_between_cp_and_the_agent_until_down(
     project: ProjectConfig, tmp_path: Path
 ) -> None:
+    """Under ``chronobox up``, a file copied in is seen by the agent, its result is copied out, and ``down``
+    stops the machine and leaves no socket or session folder behind."""
     # Own cache and runtime folders, so the test sees exactly what up leaves behind.
     cache = Path(tempfile.mkdtemp(prefix="cbx-"))
     env = {**os.environ, "XDG_CACHE_HOME": str(cache), "XDG_RUNTIME_DIR": str(cache), "PYTHONUNBUFFERED": "1"}

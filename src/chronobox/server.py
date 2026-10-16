@@ -169,10 +169,16 @@ def build_server(
 
 
 def load_project(args: argparse.Namespace) -> ProjectConfig | None:
+    """The project's config when ``--project`` is given, else ``None``.
+
+    Raises:
+        ConfigError: If the project's ``chronobox.toml`` is missing or invalid.
+    """
     return load_config(args.project) if args.project else None
 
 
 def machine_spec(args: argparse.Namespace) -> MachineSpec:
+    """The machine described by the command-line options (no project): image, setup script, size."""
     setup = (args.setup.read_text(),) if args.setup else ()
     return MachineSpec(
         setup=setup,
@@ -184,12 +190,21 @@ def machine_spec(args: argparse.Namespace) -> MachineSpec:
 
 
 async def run_local(args: argparse.Namespace) -> None:
+    """Own a machine and serve it to one agent over stdio MCP; the machine stops when the agent leaves."""
     async with _owned_service(args) as service:
         server = build_server(args.profile, service.call, guard=args.guard, project_note=_note(args))
         await server.run_stdio_async()
 
 
 async def run_serving(args: argparse.Namespace) -> None:
+    """Own a machine and serve it on ``--serve``'s unix socket until a shutdown request.
+
+    For a project (``chronobox up``), also say on stderr whether it came up; a machine that failed
+    to start exits instead of serving errors. The socket file is removed on the way out.
+
+    Raises:
+        SystemExit: If a project's machine failed to start.
+    """
     async with _owned_service(args) as service:
         await service.serve(args.serve)
         try:
@@ -205,6 +220,7 @@ async def run_serving(args: argparse.Namespace) -> None:
 
 
 def _up_message(project: Path, service: WorkspaceService) -> str:
+    """What ``chronobox up`` prints once the boot is over: the failure, or how to use the machine."""
     if service.error:
         return f"chronobox: the machine failed to start: {service.error}"
     folder = load_config(project).path
@@ -215,7 +231,10 @@ def _up_message(project: Path, service: WorkspaceService) -> str:
 
 
 async def run_connected(args: argparse.Namespace) -> None:
+    """Serve MCP (stdio, or HTTP with ``--http``) for the machine a ``--serve`` process owns."""
+
     async def call(method: str, *call_args: Any) -> str:
+        """Forward one tool call to the serving process."""
         return await call_remote(args.connect, method, *call_args)
 
     server = build_server(args.profile, call, guard=args.guard, project_note=_note(args))
@@ -233,6 +252,11 @@ async def run_connected(args: argparse.Namespace) -> None:
 
 @contextlib.asynccontextmanager
 async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-def]
+    """A booting workspace service for the options (a project's or a plain machine), stopped and
+    cleaned up on exit.
+
+    The boot runs in the background, so the server answers at once; tool calls wait for it.
+    """
     project = load_project(args)
     # A project's server runs from the project's folder: keep its VMs out of it.
     backend = FirecrackerBackend(args.root or (session_root() if project else None))
@@ -255,6 +279,7 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse ``chronobox-mcp`` options; ``--http`` needs ``--connect``, ``--setup`` excludes ``--project``."""
     parser = argparse.ArgumentParser(prog="chronobox-mcp", description=__doc__.splitlines()[0])
     parser.add_argument("--profile", type=Profile, choices=list(Profile), default=Profile.CHRONOBOX)
     parser.add_argument(
@@ -284,11 +309,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _note(args: argparse.Namespace) -> str | None:
+    """The project note for the agent's instructions, if serving a project."""
     project = load_project(args)
     return project_note(project) if project else None
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Run ``chronobox-mcp``: join the project's ``up`` machine if one is serving, else own one.
+
+    Args:
+        argv: Options; the process's own when ``None`` (``chronobox up`` and ``chronobox mcp`` pass theirs).
+    """
     args = parse_args(argv)
     try:
         project = load_project(args)

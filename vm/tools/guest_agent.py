@@ -91,6 +91,7 @@ class AgentError(Exception):
 
 
 def load_image_config() -> dict:
+    """The image's Docker config written by ``chronobox build``; empty if the image has none."""
     try:
         return json.loads(IMAGE_CONFIG.read_text())
     except FileNotFoundError:
@@ -121,6 +122,11 @@ ISOLATED = ["unshare", "--mount", "--propagation", "private", "chroot", str(ROOT
 
 
 def run(command: str, timeout: float, *, isolated: bool = False) -> dict:
+    """Run a command in the image; the reply is ``{"code": ..., "output": ...}``.
+
+    Shared commands run one at a time with the saved working folder and exports; isolated ones
+    run alongside them, without that state (see the module docstring).
+    """
     if isolated:
         # The script is a single braced group: the shell parses all of it before running it,
         # so nothing it starts can read the rest of the script from stdin.
@@ -130,6 +136,17 @@ def run(command: str, timeout: float, *, isolated: bool = False) -> dict:
 
 
 def execute(argv: list[str], env: dict[str, str], timeout: float, *, script: str | None) -> dict:
+    """Run ``argv`` in its own session and return its exit code and combined output.
+
+    Args:
+        argv: The command (chroot into the image and its shell).
+        env: Its whole environment.
+        timeout: Seconds; past it the process is killed and the code is 124.
+        script: Written to its stdin if given; otherwise stdin is empty.
+
+    Returns:
+        ``{"code": ..., "output": ...}``.
+    """
     # Output goes to a file, not a pipe: background services started by the
     # command keep the descriptor open, and we must not wait for them.
     with tempfile.TemporaryFile() as out:
@@ -181,11 +198,20 @@ def in_image(work: Callable[[], bytes]) -> bytes:
 
 
 def owned_by_root(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo:
+    """Tar's ``tar`` filter (nothing lands outside the destination; setuid and group/other write bits
+    are dropped), with every file owned by root."""
     return tarfile.tar_filter(member, destination).replace(uid=0, gid=0, uname="root", gname="root")
 
 
 def put(path: str, archive: bytes) -> None:
+    """Unpack a tar archive at ``path`` in the image (created if missing).
+
+    Raises:
+        AgentError: If unpacking fails.
+    """
+
     def unpack() -> bytes:
+        """Runs chrooted in the image; returns nothing to send back."""
         os.makedirs(path, exist_ok=True)
         with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
             tar.extractall(path, filter=owned_by_root)
@@ -208,11 +234,19 @@ def is_excluded(relative: str, patterns: list[str]) -> bool:
 
 
 def get(path: str, exclude: list[str]) -> bytes:
+    """A tar archive of ``path`` in the image: a folder's content, or one file under its name.
+
+    Raises:
+        AgentError: If ``path`` does not exist or cannot be read.
+    """
+
     def skip_excluded(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        """Leave out members that match ``exclude``, and what is under them."""
         relative = member.name.removeprefix("./")
         return None if relative != "." and is_excluded(relative, exclude) else member
 
     def pack() -> bytes:
+        """Runs chrooted in the image; returns the archive."""
         if not os.path.lexists(path):
             raise FileNotFoundError(path)
         # A folder's content goes in as "./...", a single file under its own name.
@@ -226,6 +260,7 @@ def get(path: str, exclude: list[str]) -> bytes:
 
 
 def set_clock(epoch: float) -> None:
+    """Set the guest's wall clock to ``epoch`` (seconds since 1970, from the host)."""
     time.clock_settime(time.CLOCK_REALTIME, epoch)
 
 
@@ -248,6 +283,7 @@ def answer(request: dict, stream: BinaryIO) -> tuple[dict, bytes]:
 
 
 def serve(connection: socket.socket) -> None:
+    """Answer the one request on a connection, then close it; any failure becomes an error reply."""
     try:
         with connection.makefile("rb") as stream:
             request = json.loads(stream.readline() or b"{}")
@@ -265,6 +301,7 @@ def serve(connection: socket.socket) -> None:
 
 
 def main() -> None:
+    """Listen on vsock and answer each connection in its own thread."""
     os.environ.setdefault("PATH", DEFAULT_PATH)
     server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     server.bind((socket.VMADDR_CID_ANY, PORT))

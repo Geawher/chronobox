@@ -106,10 +106,12 @@ class ImageConfig:
 
     @classmethod
     def load(cls, path: Path) -> ImageConfig:
+        """Read a config written by ``save``."""
         fields = json.loads(path.read_text())
         return cls(**{**fields, "entrypoint": tuple(fields["entrypoint"]), "cmd": tuple(fields["cmd"])})
 
     def save(self, path: Path) -> None:
+        """Write the config as JSON (next to the disk, and inside it for the guest agent)."""
         path.write_text(json.dumps(asdict(self), indent=2) + "\n")
 
 
@@ -139,14 +141,17 @@ def check_image_name(name: str) -> str:
 
 
 def image_dir(vm_dir: Path, name: str) -> Path:
+    """The folder holding an image's disk and config."""
     return vm_dir / IMAGES_DIR / name
 
 
 def image_disk(vm_dir: Path, name: str) -> Path:
+    """The image's ext4 disk, which machines of that image boot as ``vdb``."""
     return image_dir(vm_dir, name) / IMAGE_DISK
 
 
 def list_images(vm_dir: Path) -> list[Image]:
+    """Built images, by name; a folder without its disk (an unfinished build) is left out."""
     images = []
     for config in sorted((vm_dir / IMAGES_DIR).glob(f"*/{IMAGE_CONFIG}")):
         disk = config.with_name(IMAGE_DISK)
@@ -252,6 +257,7 @@ def _export_disk(reference: str, target: Path, *, config: ImageConfig | None) ->
 
 
 def _pull_if_missing(reference: str) -> None:
+    """Pull ``reference`` only when Docker does not have it, so local images are used as they are."""
     try:
         _docker("image", "inspect", reference)
     except ImageError:
@@ -259,6 +265,11 @@ def _pull_if_missing(reference: str) -> None:
 
 
 def _docker(*args: str) -> str:
+    """Run a docker command and return its output.
+
+    Raises:
+        ImageError: If docker is not installed or the command fails (with the end of its stderr).
+    """
     if shutil.which("docker") is None:
         raise ImageError("docker is needed to build images")
     try:
