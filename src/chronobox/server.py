@@ -174,9 +174,11 @@ def build_server(
         (default: the machine as it was before your work) after the project files of `code_from`
         are deployed there; `check`, if given, runs after it to confirm the result. When both
         succeed, the patch, the script and the replay's report are saved in
-        .chronobox/exports/handoff/ for the user; otherwise you get the output to fix it. Write
-        the script for the real machine: no values you only saw in this session, and safe to run
-        twice where you can."""
+        .chronobox/exports/handoff/ for the user; otherwise you get the output to fix it. Pass the
+        script's text, not the path of a file you wrote in a machine: the replay machine only has
+        the project files. Write the script for the real machine: no values you only saw in this
+        session, safe to run twice where you can, and waiting for what it restarts to be ready
+        (one good replay does not rule out a race)."""
         return await call("verify_script", script, check, code_from, checkpoint)
 
     tools: list[Call] = [run_guarded if guard else run, wait]
