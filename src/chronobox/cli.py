@@ -33,7 +33,7 @@ from chronobox.project import ProjectBoot, default_warm_dir, session_root, up_so
 from chronobox.service import Op, ServiceError, get_remote, is_serving, put_remote, request
 from chronobox.vm import FirecrackerBackend, VMError, default_vm_dir
 
-MIB = 2**20
+BYTES_PER_MIB = 1024 * 1024
 MAX_SOCKET_PATH = 107  # bytes in sockaddr_un.sun_path, without the final NUL
 
 
@@ -51,7 +51,8 @@ def build(args: argparse.Namespace) -> None:
             context=args.context,
             name=args.name,
         )
-    print(f"built image {image.name!r} from {image.config.source} ({image.size_bytes / MIB:.0f} MiB)")
+    size_mib = image.size_bytes / BYTES_PER_MIB
+    print(f"built image {image.name!r} from {image.config.source} ({size_mib:.0f} MiB)")
     print(f"use it with: chronobox-mcp --image {image.name}")
 
 
@@ -82,7 +83,7 @@ def show_images(args: argparse.Namespace) -> None:
         return
     width = max(len(image.name) for image in images)
     for image in images:
-        print(f"{image.name:<{width}}  {image.size_bytes / MIB:>7.0f} MiB  {image.config.source}")
+        print(f"{image.name:<{width}}  {image.size_bytes / BYTES_PER_MIB:>7.0f} MiB  {image.config.source}")
 
 
 def warm(args: argparse.Namespace) -> None:
