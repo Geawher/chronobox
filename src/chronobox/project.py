@@ -2,12 +2,13 @@
 
 A fresh boot copies the project into the machine, runs ``prepare``, starts the services
 (each kept running by a small restart loop, logged to ``/var/log/chronobox/<name>.log``)
-and waits until each is ready, then runs ``setup``. The prepared machine is saved as a
-**warm snapshot**, keyed by the config, the project's files and the VM disks; while none of
-them changes, later sessions restore it in about 0.1 s instead of preparing again.
+and waits until each is ready, then runs ``setup`` and starts the ``after_setup`` services. The
+prepared machine is saved as a **warm snapshot**, keyed by the config, the project's files and
+the VM disks; while none of them changes, later sessions restore it in about 0.1 s instead of
+preparing again.
 
-Getting work out: ``project_diff`` is a patch from the project as it was copied in (kept
-with the machine) to the project as the machine has it now; ``export`` copies a path from
+Getting work out: ``project_diff`` is a patch from the project as it was when the machine was
+ready (kept with the machine) to the project as the machine has it now; ``export`` copies a path from
 the machine into ``.chronobox/exports``.
 """
 
@@ -50,8 +51,8 @@ PARTIAL_SUFFIX = ".partial"
 STALE_PARTIAL_S = 3600  # a half-written warm snapshot this old was left by a crash
 # Bump when what a prepared machine holds changes (e.g. how services are started), so warm
 # snapshots made by older code are not reused.
-WARM_FORMAT = "2"
-BASELINE = "project.tar"  # the project as it was copied in: what diffs compare against
+WARM_FORMAT = "3"
+BASELINE = "project.tar"  # the project once the machine was ready: what diffs compare against
 NO_DIFFERENCES = 0
 DIFFERENCES = 1
 DIFF_COMMAND = (
@@ -263,25 +264,28 @@ class ProjectBoot:
         return Booted(machine)
 
     async def _prepare(self, machine: Machine) -> None:
-        """Copy the project in (keeping the archive as the diff baseline), run ``prepare``, start
-        each service and wait until it is ready, then run ``setup``.
+        """Copy the project in, run ``prepare``, start each service and wait until it is ready, run
+        ``setup``, then start the ``after_setup`` services the same way.
+
+        The project folder as it is then becomes the diff baseline, so files the project's own
+        steps write there (fixtures copied into a media folder, build output) are not reported as
+        changes.
 
         Raises:
             VMError: If any step fails.
         """
         config = self.config
         archive = await asyncio.to_thread(pack_project, config)
-        self.baseline.write_bytes(archive)
         await machine.put(config.target, archive)
         await _check(machine, f"cd {shlex.quote(config.target)}", "enter the project")
         for command in config.prepare:
             await _check(machine, command, "prepare")
-        for service in config.services:
-            await _check(machine, service_command(service, config.target), f"start {service.name}")
-            await _wait_ready(machine, service)
+        await _start_services(machine, config, after_setup=False)
         for command in config.setup:
             await _check(machine, command, "setup")
+        await _start_services(machine, config, after_setup=True)
         await _check(machine, f"cd {shlex.quote(config.target)}", "enter the project")
+        self.baseline.write_bytes(await machine.get(config.target, exclude=config.exclude))
 
     def _warm_path(self) -> Path | None:
         """This project's warm snapshot folder for its current files and VM; ``None`` without
@@ -337,11 +341,12 @@ def _prune_one(entry: Path) -> None:
 
 
 async def project_diff(machine: Machine, config: ProjectConfig, baseline: bytes) -> str:
-    """A patch from the project as it was copied in (``baseline``, a ``pack_project`` archive)
-    to the project as the machine has it now; ``git apply`` in the local copy applies it.
+    """A patch from the project as it was when the machine was ready (``baseline``, an archive of
+    the project folder) to the project as the machine has it now; ``git apply`` in the local copy
+    applies it.
 
-    Comparing with what was copied in, not with the local files, keeps edits made locally
-    since then out of the patch.
+    Comparing with the machine's own starting point, not with the local files, keeps edits made
+    locally since then, and files the project's setup wrote, out of the patch.
 
     Raises:
         VMError: If the project folder cannot be read in the machine.
@@ -402,7 +407,7 @@ def project_tools(workspace: Workspace, boot: ProjectBoot) -> dict[str, Method]:
             patch = await project_diff(workspace.machine(where), config, baseline)
         except (VMError, ProjectError, tarfile.TarError, OSError) as error:
             return f"error: {error}"
-        return patch or f"no changes: {config.target} on {where} matches the project as copied in"
+        return patch or f"no changes: {config.target} on {where} matches the project as it started"
 
     async def export_path(path: str, where: str = MAIN) -> str:
         """The ``export`` tool: copy ``path`` from ``where`` into the exports folder; failures
@@ -422,9 +427,21 @@ def project_note(config: ProjectConfig) -> str:
     return (
         f"The project {config.path.name} is copied at {config.target} in the machine (commands start "
         f"there). Its services ({services}) are running, restarted if they exit; logs in {LOG_DIR}. "
-        "`diff` shows what changed in the project on the main machine or a fork since it was copied "
-        "in, as a patch for the local copy; `export` copies files out of the machine."
+        "`diff` shows what changed in the project on the main machine or a fork since the machine "
+        "started, as a patch for the local copy; `export` copies files out of the machine."
     )
+
+
+async def _start_services(machine: Machine, config: ProjectConfig, *, after_setup: bool) -> None:
+    """Start the services of one phase (before or after ``setup``) in order, each ready before the next.
+
+    Raises:
+        VMError: If a service does not start or does not get ready.
+    """
+    for service in config.services:
+        if service.after_setup == after_setup:
+            await _check(machine, service_command(service, config.target), f"start {service.name}")
+            await _wait_ready(machine, service)
 
 
 async def _check(machine: Machine, command: str, step: str) -> str:

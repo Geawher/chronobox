@@ -217,3 +217,40 @@ async def test_up_shares_one_machine_between_cp_and_the_agent_until_down(
     finally:
         up.kill()
         shutil.rmtree(cache, ignore_errors=True)
+
+
+async def test_an_after_setup_service_starts_once_setup_is_done(
+    backend: FirecrackerBackend, tmp_path: Path
+) -> None:
+    """A service marked ``after_setup`` sees what ``setup`` made (as an app server needs its
+    migrations); one started before setup would read nothing and never get ready."""
+    project = tmp_path / "ordered"
+    project.mkdir()
+    (project / "chronobox.toml").write_text(
+        'setup = ["echo migrated > /src/setup-done"]\n'
+        "[[service]]\n"
+        'name = "app"\n'
+        'start = "cat /src/setup-done > /tmp/seen 2>&1; sleep 1000"\n'
+        'ready = "grep -q migrated /tmp/seen"\n'
+        "ready_timeout = 20\n"
+        "after_setup = true\n"
+    )
+    config = load_config(project)
+    workspace, _ = await start(backend, config, None)
+    assert await output(workspace, "cat /tmp/seen") == "migrated"
+    await workspace.close()
+
+
+async def test_files_the_setup_writes_are_not_reported_as_changes(
+    project: ProjectConfig, backend: FirecrackerBackend
+) -> None:
+    """A setup that writes into the project folder (fixtures copied to a media folder, say) leaves
+    an untouched machine with no diff, while a real edit afterwards still shows."""
+    generated = replace(project, setup=(*project.setup, "mkdir -p media && echo copied > media/photo.jpg"))
+    workspace, boot = await start(backend, generated, None)
+    baseline = boot.baseline.read_bytes()
+    assert await project_diff(workspace.machine(MAIN), generated, baseline) == ""
+    await workspace.run("echo '# edited' >> app.py")
+    patch = await project_diff(workspace.machine(MAIN), generated, baseline)
+    assert "b/app.py" in patch and "media/photo.jpg" not in patch
+    await workspace.close()

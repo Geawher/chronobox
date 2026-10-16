@@ -51,7 +51,8 @@ def test_image_from_a_reference_gets_a_file_safe_name(tmp_path: Path) -> None:
 
 
 def test_services_keep_their_options(tmp_path: Path) -> None:
-    """A service's env, restart and ready timeout are read as written, the workdir defaulting to empty."""
+    """A service's env, restart, ready timeout and phase are read as written, the workdir defaulting to
+    empty and services starting before setup unless they say otherwise."""
     text = """
 [[service]]
 name = "db"
@@ -60,10 +61,16 @@ ready = "pg_isready"
 env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 restart = false
 ready_timeout = 30
+
+[[service]]
+name = "app"
+start = "python manage.py runserver"
+after_setup = true
 """
-    (service,) = load_config(write(tmp_path, text)).services
-    assert service.env == {"POSTGRES_HOST_AUTH_METHOD": "trust"}
-    assert (service.restart, service.ready_timeout, service.workdir) == (False, 30.0, "")
+    db, app = load_config(write(tmp_path, text)).services
+    assert db.env == {"POSTGRES_HOST_AUTH_METHOD": "trust"}
+    assert (db.restart, db.ready_timeout, db.workdir, db.after_setup) == (False, 30.0, "", False)
+    assert app.after_setup
 
 
 @pytest.mark.parametrize(

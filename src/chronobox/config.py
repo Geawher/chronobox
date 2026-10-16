@@ -54,7 +54,9 @@ TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "
 MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
 PROJECT_KEYS = frozenset({"path", "target", "exclude"})
 IMAGE_KEYS = frozenset({"name", "reference", "dockerfile", "context"})
-SERVICE_KEYS = frozenset({"name", "start", "ready", "env", "workdir", "restart", "ready_timeout"})
+SERVICE_KEYS = frozenset(
+    {"name", "start", "ready", "env", "workdir", "restart", "ready_timeout", "after_setup"}
+)
 # Service names become file names in commands, so keep them to what needs no quoting.
 SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -85,6 +87,12 @@ exclude = {exclude}  # not copied in (.git and .chronobox never are)
 # start = "docker-entrypoint.sh postgres"  # runs in the foreground; restarted if it exits
 # ready = "pg_isready -h 127.0.0.1"        # succeeds once the service answers
 # env = {{ POSTGRES_HOST_AUTH_METHOD = "trust" }}
+#
+# [[service]]
+# name = "app"
+# start = "python manage.py runserver 127.0.0.1:8000"
+# ready = "curl -sf 127.0.0.1:8000/"
+# after_setup = true                       # start once setup (e.g. migrations) is done
 """
 
 
@@ -111,7 +119,7 @@ class ImageSource:
 
 @dataclass(frozen=True)
 class Service:
-    """A long-running process of the project, started in the machine before ``setup``.
+    """A long-running process of the project, started in the machine before ``setup`` (or after it).
 
     Attributes:
         name: Used for its log, ``/var/log/chronobox/<name>.log``.
@@ -121,6 +129,8 @@ class Service:
         workdir: Where ``start`` runs; defaults to the project's target.
         restart: Start it again whenever it exits (like Docker's ``unless-stopped``).
         ready_timeout: Seconds to wait for ``ready`` before the boot fails.
+        after_setup: Start it once ``setup`` is done instead of before, e.g. an app server that
+            needs the migrations ``setup`` runs against a database service.
     """
 
     name: str
@@ -130,6 +140,7 @@ class Service:
     workdir: str = ""
     restart: bool = True
     ready_timeout: float = DEFAULT_READY_TIMEOUT_S
+    after_setup: bool = False
 
 
 @dataclass(frozen=True)
@@ -286,6 +297,7 @@ def _service(entry: dict[str, Any]) -> Service:
         workdir=entry.get("workdir", ""),
         restart=bool(entry.get("restart", True)),
         ready_timeout=float(entry.get("ready_timeout", DEFAULT_READY_TIMEOUT_S)),
+        after_setup=bool(entry.get("after_setup", False)),
     )
 
 
