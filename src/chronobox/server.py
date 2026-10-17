@@ -187,33 +187,59 @@ def build_server(
         check: str,
         pre: str = "",
         rollback: str = "",
+        assume: str = "",
+        load: str = "",
+        load_check: str = "",
+        sample: str = "",
         twice: bool = True,
+        background: bool = False,
         code_from: str = MAIN,
         checkpoint: str = "start",
         timeout: float = 900,
     ) -> str:
         """Check a change script the way the user will run it on the real machine, and hand it over
-        with the patch: what it saves in .chronobox/exports/handoff/ is what the user runs. Use it when
-        the change needs actions and not only file edits: a migration or a backfill, restarting
-        services, a setting outside the project.
+        with the patch: what it saves in .chronobox/exports/handoff/ is what the user runs, as
+        ./apply.sh (its #! line picks the shell; /bin/sh without one). Use it when the change needs
+        actions and not only file edits: a migration or a backfill, restarting services, a setting
+        outside the project.
 
-        The replay: a new fork of `checkpoint` (default: the machine as it was before your work, like
-        the real one); `pre` if given (before the new files, with the old code still running); the
-        project files of `code_from` (a machine, or "local" for the files you edited locally); the
-        script, twice unless twice=false (deployments get retried); then `check`, the project's own
-        checks and traffic, the services' readiness, and a comparison with the machine you tested on.
-        `rollback`, if given, must undo the change once the old files are back.
+        The replay: a new fork of `checkpoint` (default: the machine before your work, like the real
+        one); `sample` if given (commands that shrink the data); `assume` (checks of what the script
+        relies on, e.g. sizes, versions, which node leads: the user runs it first and stops if it
+        fails); `load` (your traffic, next to the project's); `pre` (before the new files, with the old
+        code still running); the project files of `code_from` (a machine, or "local" for the files you
+        edited locally); the script. With twice=true (default) it is also run again once it ended,
+        and must then finish quickly, and on copies of the replay it is killed midway and run again:
+        deployments get retried, sometimes after a crash. Then `check`, the project's checks,
+        `load_check` once the traffic stopped, the services' readiness, and a comparison with the
+        machine you tested on. `rollback`, if given, must undo the change once the old files are back.
 
         `check` is required and decides whether you are done: a command that fails unless the change
         works the way the user asked, used as users would (call the new endpoint, insert a new row and
-        read it back), not only that the services are up. On failure nothing is saved and the
-        hand-off saved before is withdrawn. Pass the scripts' text, not paths: the replay only has
-        the project files. Write them for the real machine, which has more data and live users: no
-        values you only saw in this session, no long locks, and wait for what you restart to be
-        ready. `timeout` is the script's limit in seconds."""
+        read it back). It runs after the script, so it cannot see what users went through during it:
+        when the change could lose or block writes (restarts, failovers, migrations under traffic),
+        pass `load` (writes like the users', each logged when acknowledged) and `load_check` (fails if
+        an acknowledged write is missing or requests failed).
+
+        Time: a replay takes as long as the script, plus the retries, and this call waits for it.
+        Know roughly how long the script takes before replaying it in full (from main, or a sample).
+        For a long operation pass `sample` to check the logic in minutes (the report says it ran on a
+        sample), or background=true to keep working and collect the result with `verify_result`. If
+        users are failing now, take the safe step on main first and hand the full change over after.
+
+        Pass the scripts' text, not paths. Write them for the real machine, which has more data and
+        live users: no values you only saw in this session, no long locks, skip what is already done
+        so a retry is quick, and wait for what you restart to answer. On failure nothing is saved and
+        the hand-off saved before is withdrawn. `timeout` limits each run of a script, in seconds."""
         return await call(
-            "verify_script", script, check, pre, rollback, twice, code_from, checkpoint, timeout
-        )
+            "verify_script", script, check, pre, rollback, assume, load, load_check, sample,
+            twice, background, code_from, checkpoint, timeout,
+        )  # fmt: skip
+
+    async def verify_result(fork: str = "", wait: float = 0) -> str:
+        """Get the result of a `verify_script` started with background=true (by default the last
+        one): waits up to `wait` seconds (at most 600) for it, else says what the replay is doing."""
+        return await call("verify_result", fork, wait)
 
     tools: list[Call] = [run_guarded if guard else run, wait]
     if profile in (Profile.ROLLBACK, Profile.CHRONOBOX):
@@ -223,7 +249,7 @@ def build_server(
     if project_note:
         tools += [diff, export, sync]
     if (project_note or handoff) and profile is Profile.CHRONOBOX:
-        tools.append(verify_script)
+        tools += [verify_script, verify_result]
     for tool in tools:
         server.add_tool(tool, name=tool.__name__.removesuffix("_guarded"))
     return server

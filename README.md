@@ -154,16 +154,26 @@ claude mcp add chronobox -- chronobox mcp --project .
     machine to run them.
 - **Hand-off scripts**: some changes are actions, not file edits (a migration, a backfill,
   restarting services, a setting outside the project). The agent writes them as a script and
-  calls `verify_script(script, check)`, which replays it the way you will run it: on a new fork
-  of the `start` checkpoint (the machine before the agent's work), after deploying the project's
-  changed files (from main, a fork, or with `code_from="local"` the files edited locally). The
-  replay passes only if the script succeeds twice in a row (deployments get retried), the
-  agent's `check` passes (it is required), every service still answers its `ready` command, and
-  a project process the agent restarted on its machine was restarted by the script too. Optional
-  `pre` (run before the new files, with the old code running) and `rollback` (run once the old
-  files are back) are replayed in their place. Then the patch, the scripts and the replay's report
-  are saved in `.chronobox/exports/handoff/`, ready for the real machine; a failed replay
-  withdraws the hand-off saved before (to `handoff-withdrawn/`).
+  calls `verify_script(script, check)`, which replays it the way you will run it (`./apply.sh`:
+  its `#!` line picks the shell, `/bin/sh` without one): on a new fork of the `start` checkpoint
+  (the machine before the agent's work), after deploying the project's changed files (from main,
+  a fork, or with `code_from="local"` the files edited locally). The replay passes only if:
+  - the script succeeds, and again when run a second time, quickly (a retry must not redo the
+    whole job), and when killed midway and run again, on copies of the replay snapshotted while
+    it ran (deployments get retried, sometimes after a crash);
+  - the agent's `check` passes (it is required), and the project's checks;
+  - the traffic run during the replay (the project's, and the agent's own `load`) lost nothing
+    (`load_check`);
+  - every service still answers its `ready` command, and a project process the agent restarted
+    on its machine was restarted by the script too.
+
+  Optional scripts are replayed in their place and handed over: `assume` (what the change relies
+  on, run first: you stop if it fails), `pre` (before the new files, with the old code running)
+  and `rollback` (once the old files are back). `sample` shrinks the replay's data so a long
+  operation's logic is checked in minutes (the report says it ran on a sample), and
+  `background=true` returns at once, the result coming from `verify_result`. Then the patch, the
+  scripts and the replay's report are saved in `.chronobox/exports/handoff/`, ready for the real
+  machine; a failed replay withdraws the hand-off saved before (to `handoff-withdrawn/`).
 - **`[handoff]`**: what you know about production, added to every replay so the agent's own check
   is not the only one:
 
@@ -174,6 +184,7 @@ claude mcp add chronobox -- chronobox mcp --project .
   load_check = "bin/traffic --report"   # after it: fails if users lost writes
   checks = ["bin/smoke-test"]           # must pass after the script
   compare = ["pg_dump -s -U postgres"]  # same output on the agent's machine and on the replay
+  sample = ["bin/keep-a-tenth"]         # optional: every replay on a sample of the data
   ```
 
   `compare` catches a script that does not reproduce what the agent tested (a column it added
@@ -215,7 +226,7 @@ data), `--mem`, `--disk`.
 | `changes(name)` | chronobox | commands, failures and files a fork changed |
 | `promote(name)` / `discard(name, lesson)` | chronobox | keep a fork as main / drop it, with a report |
 | `diff(where)` / `export(path, where)` / `sync(where)` | all, with `--project` | the project's changes as a patch / copy files out / copy local edits in |
-| `verify_script(script, check, ...)` | chronobox, with `--project` | replay a change script on a fresh fork with the project's checks, then save the hand-off |
+| `verify_script(script, check, ...)` / `verify_result(fork, wait)` | chronobox, with `--project` or `--handoff` | replay a change script on a fresh fork (retries, kills, traffic, the project's checks), then save the hand-off / collect a replay run in the background |
 
 With `--profile chronobox`, risky commands (deletes, kills, restarts, SQL changes,
 overwrites) are checkpointed automatically first.

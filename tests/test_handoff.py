@@ -2,6 +2,7 @@
 patch when everything passes, and the earlier hand-off withdrawn when something does not."""
 
 import io
+import re
 import shutil
 import tarfile
 from collections.abc import AsyncIterator
@@ -9,8 +10,10 @@ from pathlib import Path
 
 import pytest
 
+from chronobox import handoff
 from chronobox.config import HandoffSettings, ProjectConfig, load_config
 from chronobox.handoff import (
+    ASSUME_FILE,
     HANDOFF_DIR,
     PATCH_FILE,
     PRE_FILE,
@@ -20,8 +23,11 @@ from chronobox.handoff import (
     WITHDRAWN_DIR,
     Scripts,
     _file_names,
-    _script_command,
+    bash_features,
+    difference,
     handoff_tools,
+    how_to_run,
+    runnable,
     save_handoff,
     withdraw_handoff,
 )
@@ -42,10 +48,38 @@ HEALTH = "curl -sf 127.0.0.1:8000/health"
 RESTART_APP = f"pkill -f '^python3 app.py' && sleep 3 && {HEALTH}"
 
 
-def test_a_script_with_a_shebang_runs_with_its_interpreter_else_with_sh() -> None:
-    """``#!/bin/bash`` scripts may use bash features, so they run by their own line; others with sh."""
-    assert _script_command("#!/bin/bash\necho hi\n").endswith(f"/{SCRIPT_FILE}")
-    assert _script_command("echo hi\n", PRE_FILE) == f"sh /root/.chronobox/{PRE_FILE}"
+def test_a_script_runs_by_its_own_shebang_and_gets_sh_without_one() -> None:
+    """Scripts are saved and run as ``./apply.sh``: a ``#!`` line is kept, a script without one gets
+    ``#!/bin/sh``, so the replay and the user run it with the same shell."""
+    assert runnable("#!/bin/bash\necho hi") == "#!/bin/bash\necho hi\n"
+    assert runnable("\necho hi\n") == "#!/bin/sh\necho hi\n"
+
+
+def test_bash_features_are_flagged_only_in_scripts_that_run_with_sh() -> None:
+    """``{1..3}`` does not expand in dash: a sh script using it is flagged, a bash script is not."""
+    loop = "for i in {1..3}; do echo $i; done\n"
+    assert bash_features(loop) == ["{1..N} ranges"]
+    assert bash_features(f"#!/usr/bin/env sh\n[[ -f x ]] && {loop}") == ["[[ ... ]]", "{1..N} ranges"]
+    assert bash_features(f"#!/bin/bash\n{loop}") == []
+    assert bash_features("echo plain\n") == []
+
+
+def test_a_difference_says_which_side_lacks_what() -> None:
+    """A comparison that differs names what only the agent's machine has (the script misses it) and
+    what only the replay has (the agent's machine lacks it), with what to do about each."""
+    text = difference("pg_dump -s", MAIN, "a\nb\ntitle text\n", "a\nb\ncreated_at\n")
+    assert "only main has" in text and "title text" in text and "add it to the script" in text
+    assert "only the replay has" in text and "created_at" in text and "on main too" in text
+    assert "only the replay" not in difference("x", MAIN, "a\nb", "a")
+
+
+def test_how_to_run_lists_the_scripts_in_order() -> None:
+    """The user runs assume, pre, the patch, then the script; rollback is how to undo."""
+    scripts = Scripts("echo go", pre="echo pre", rollback="echo undo", assume="true")
+    text = how_to_run(scripts, True, "/src")
+    order = [text.index(part) for part in (ASSUME_FILE, PRE_FILE, PATCH_FILE, f"./{SCRIPT_FILE}")]
+    assert order == sorted(order) and "/src" in text and ROLLBACK_FILE in text
+    assert PATCH_FILE not in how_to_run(Scripts("echo go"), False, "/root")
 
 
 def test_file_names_are_relative_to_the_project_whatever_the_archive_prefix() -> None:
@@ -70,7 +104,7 @@ def test_a_new_handoff_replaces_the_previous_one(tmp_path: Path) -> None:
     (folder / "stale.txt").write_text("old")
     save_handoff(folder, Scripts("echo two\n"), "", "report two")
     assert sorted(path.name for path in folder.iterdir()) == [SCRIPT_FILE, REPORT_FILE]
-    assert (folder / SCRIPT_FILE).read_text() == "echo two\n"
+    assert (folder / SCRIPT_FILE).read_text() == "#!/bin/sh\necho two\n"
     assert (folder / SCRIPT_FILE).stat().st_mode & 0o111
 
 
@@ -84,7 +118,7 @@ def test_a_withdrawn_handoff_moves_aside_and_replaces_the_last_withdrawn_one(tmp
     save_handoff(folder, Scripts("echo two"), "", "report two")
     assert withdraw_handoff(folder, withdrawn)
     assert not folder.exists()
-    assert (withdrawn / SCRIPT_FILE).read_text() == "echo two\n"
+    assert (withdrawn / SCRIPT_FILE).read_text() == "#!/bin/sh\necho two\n"
 
 
 @pytest.mark.vm
@@ -155,7 +189,7 @@ async def test_a_verified_script_is_saved_with_the_patch_and_main_is_untouched(
     reply = await verify(script, check=HAS_TITLE)
     assert "passed" in reply and "(second run): exit 0" in reply and "hand-off saved" in reply, reply
     folder = plain.path / HANDOFF_DIR
-    assert (folder / SCRIPT_FILE).read_text() == script
+    assert (folder / SCRIPT_FILE).read_text() == runnable(script)
     patch = (folder / PATCH_FILE).read_text()
     assert "b/NOTES.md" in patch and "a/migrate.py" in patch
     assert "replay-1" in (folder / REPORT_FILE).read_text()
@@ -174,7 +208,7 @@ async def test_failures_are_reported_not_saved_and_withdraw_the_saved_handoff(
     failed = await verify("echo half done; exit 3", check="true")
     assert "exit 3" in failed and "half done" in failed and "not saved" in failed, failed
     assert "withdrawn" in failed and not (plain.path / HANDOFF_DIR).exists()
-    assert (plain.path / WITHDRAWN_DIR / SCRIPT_FILE).read_text().strip() == ADD_TITLE
+    assert (plain.path / WITHDRAWN_DIR / SCRIPT_FILE).read_text() == runnable(ADD_TITLE)
     unchecked = await verify("true", check="test -f /nonexistent")
     assert "your check failed" in unchecked and "not saved" in unchecked
     assert "failed when run a second time" in await verify(ADD_TITLE_ONCE, check=HAS_TITLE)
@@ -193,9 +227,10 @@ async def test_the_project_traffic_and_comparisons_hold_the_replay_to_what_was_t
     workspace, verify = checked_session
     await workspace.run(ADD_TITLE)
     missed = await verify("true", check=HEALTH)
-    assert "differs between main and the replay" in missed and "title" in missed, missed
+    assert "differs between main and the replay" in missed and "only main has" in missed, missed
+    assert "title" in missed
     reply = await verify(ADD_TITLE, check=HAS_TITLE)
-    assert "passed" in reply and "load_check: exit 0" in reply and "0 of them missing" in reply, reply
+    assert "passed" in reply and "load_check `python3 traffic.py --report`: exit 0" in reply, reply
 
 
 @pytest.mark.vm
@@ -241,21 +276,106 @@ async def test_pre_and_rollback_scripts_are_replayed_in_their_place(
     assert f"{ROLLBACK_FILE} failed" in await verify("test -e NEW.txt", check="true", rollback="exit 4")
 
 
-@pytest.mark.vm
-async def test_a_machine_without_a_project_hands_over_the_script_alone(tmp_path: Path) -> None:
-    """Without a project nothing is deployed and there is no patch: the replay runs the script and the
-    check on a fork of the start, and the hand-off holds the script and the report."""
+@pytest.fixture
+async def bare(tmp_path: Path) -> AsyncIterator[tuple[Workspace, dict[str, Method]]]:
+    """A machine without a project (``/etc/app.conf`` says old), with its hand-off tools."""
     backend = FirecrackerBackend(tmp_path / "vms")
     workspace = Workspace(backend, MachineSpec(setup=("echo old > /etc/app.conf",)))
     await workspace.start()
-    try:
-        tools = handoff_tools(workspace, None, settings=HandoffSettings(), exports=tmp_path / "out")
-        reply = await tools["verify_script"](
-            "sed -i s/old/new/ /etc/app.conf", check="grep -qx new /etc/app.conf"
-        )
-        assert "passed" in reply and "(no project changes)" not in reply, reply
-        saved = sorted(path.name for path in (tmp_path / "out" / "handoff").iterdir())
-        assert saved == [SCRIPT_FILE, REPORT_FILE]
-    finally:
-        await workspace.close()
-        await backend.cleanup()
+    yield workspace, handoff_tools(workspace, None, settings=HandoffSettings(), exports=tmp_path / "out")
+    await workspace.close()
+    await backend.cleanup()
+
+
+@pytest.mark.vm
+async def test_a_machine_without_a_project_hands_over_the_script_alone(
+    bare: tuple[Workspace, dict[str, Method]], tmp_path: Path
+) -> None:
+    """Without a project nothing is deployed and there is no patch: the replay runs the script and the
+    check on a fork of the start, and the hand-off holds the script and the report. Nothing watched
+    users during the script, which the report says; a sh script using bash features is flagged."""
+    _, tools = bare
+    script = "sed -i s/old/new/ /etc/app.conf; for i in {1..2}; do :; done"
+    reply = await tools["verify_script"](script, check="grep -qx new /etc/app.conf")
+    assert "passed" in reply and "(no project changes)" not in reply, reply
+    assert "nothing checked what users saw" in reply and "{1..N} ranges" in reply, reply
+    assert "too soon to be killed midway" in reply
+    saved = sorted(path.name for path in (tmp_path / "out" / "handoff").iterdir())
+    assert saved == [SCRIPT_FILE, REPORT_FILE]
+
+
+# Finishes in ~14 s; once started it refuses to run again unless it finished (not resumable).
+FRAGILE = """[ -e /root/done ] && exit 0
+[ -e /root/started ] && { echo "found a half-done job"; exit 5; }
+touch /root/started; sleep 14; touch /root/done
+"""
+RESUMABLE = "[ -e /root/done ] && exit 0\ntouch /root/started; sleep 14; touch /root/done\n"
+
+
+@pytest.mark.vm
+async def test_a_script_killed_midway_must_finish_the_job_when_run_again(
+    bare: tuple[Workspace, dict[str, Method]],
+) -> None:
+    """Copies of the replay taken while the script runs (at about 3 s and 10 s) kill it and run it
+    again: a script that cannot pick up a half-done job fails there, although it passed when run
+    again after it finished; the failing copy stays open. A script that resumes passes."""
+    workspace, tools = bare
+    fragile = await tools["verify_script"](FRAGILE, check="test -e /root/done")
+    assert "(second run): exit 0" in fragile and "not saved" in fragile, fragile
+    assert re.search(r"killed \d s in and run again \(on fork 'replay-1-crash-1', kept", fragile), fragile
+    assert "found a half-done job" in fragile and "replay-1-crash-1" in workspace.forks
+    resumable = await tools["verify_script"](RESUMABLE, check="test -e /root/done")
+    retried = re.findall(r"\[killed \d+ s in and run again\] apply.sh \(run again\): exit 0", resumable)
+    assert "passed" in resumable and len(retried) == 2, resumable
+    assert not any("replay-2-crash" in fork for fork in workspace.forks)
+
+
+@pytest.mark.vm
+async def test_a_second_run_that_redoes_the_whole_job_fails(
+    bare: tuple[Workspace, dict[str, Method]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run again once it ended, a script must be quick (here: within half its first run, at least
+    2 s): one that redoes everything is stopped and told to skip finished work."""
+    monkeypatch.setattr(handoff, "SECOND_RUN_MIN_S", 2.0)
+    _, tools = bare
+    reply = await tools["verify_script"]("sleep 6", check="true")
+    assert "was still going after 3 s" in reply and "skip what is already done" in reply, reply
+
+
+@pytest.mark.vm
+async def test_assumptions_traffic_and_samples_are_part_of_the_replay(
+    bare: tuple[Workspace, dict[str, Method]], tmp_path: Path
+) -> None:
+    """``assume`` runs first and is handed over (the user stops if it fails); ``load`` runs during the
+    replay and ``load_check`` judges it after; ``sample`` runs before anything and is reported."""
+    _, tools = bare
+    verify = tools["verify_script"]
+    load = "while true; do echo w >> /root/writes; sleep 0.2; done"
+    reply = await verify(
+        "sed -i s/old/new/ /etc/app.conf", check="grep -qx new /etc/app.conf",
+        assume="grep -qx old /etc/app.conf || grep -qx new /etc/app.conf", load=load,
+        load_check="test $(wc -l < /root/writes) -gt 3", sample="touch /root/sampled",
+    )  # fmt: skip
+    assert "passed" in reply and "ON A SAMPLE" in reply and "nothing checked" not in reply, reply
+    assert f"./{ASSUME_FILE}" in reply.split("\n")[0]
+    assert ASSUME_FILE in {path.name for path in (tmp_path / "out" / "handoff").iterdir()}
+    unmet = await verify("true", check="true", assume="test -e /etc/production-only")
+    assert f"{ASSUME_FILE} failed on the replay" in unmet, unmet
+    lost = await verify("true", check="true", load=load, load_check="false")
+    assert "your traffic saw a problem" in lost, lost
+    assert "pass load too" in await verify("true", check="true", load_check="true")
+
+
+@pytest.mark.vm
+async def test_a_replay_in_the_background_is_collected_with_verify_result(
+    bare: tuple[Workspace, dict[str, Method]],
+) -> None:
+    """In the background the call returns at once; ``verify_result`` says what the replay is doing,
+    then gives its result once, when it ended."""
+    _, tools = bare
+    started = await tools["verify_script"]("sleep 4", check="true", twice=False, background=True)
+    assert "in the background on fork 'replay-1'" in started, started
+    assert "still replaying on fork 'replay-1'" in await tools["verify_result"]()
+    done = await tools["verify_result"]("replay-1", 120)
+    assert "passed" in done and "hand-off saved" in done, done
+    assert "no replay is waiting" in await tools["verify_result"]()

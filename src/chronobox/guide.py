@@ -47,18 +47,33 @@ through the `chronobox` MCP tools.
 
 ### Handing a change over (when you have `verify_script`)
 - A change that needs more than file edits (a migration, a backfill, a restart, a setting outside
-  the project) is handed over as a script plus the patch. The user runs the script on the real
-  machine right after applying the patch.
+  the project) is handed over as a script plus the patch. The user runs `./apply.sh` on the real
+  machine right after applying the patch: its `#!` line picks the shell (`/bin/sh` without one).
 - `verify_script(script, check)` replays the script on a fresh copy of the machine as it was before
-  your work, with your files deployed, runs it twice, then runs your check and the project's own
-  checks. When everything passes, `.chronobox/exports/handoff/` holds the hand-off; a failed
-  replay withdraws the one saved before. Pass `code_from="local"` when you edited the files here.
+  your work, with your files deployed. It runs it again once it ended (that second run must be
+  quick), kills it midway on copies and runs it again there, then runs your check and the
+  project's own checks. When everything passes, `.chronobox/exports/handoff/` holds the hand-off; a
+  failed replay withdraws the one saved before. Pass `code_from="local"` when you edited the files
+  here.
 - Your `check` decides whether you are done: make it fail unless the change works the way the user
   asked, used as users would (call the new endpoint, insert a new row and read it back), not only
   that the services are up.
+- The check runs after the script and cannot see what users went through during it. When the
+  change could lose or block writes (restarts, failovers, migrations under traffic), pass `load`
+  (writes like the users', each logged when acknowledged) and `load_check` (fails if an
+  acknowledged write is missing).
+- `assume` holds what the script relies on (table sizes, versions, which node leads): the user runs
+  it first and stops if it fails, so a production that differs from your copy is caught before
+  anything changes.
 - Write the script for the real machine, which has more data and live users: no values you only
-  saw in this session, batches instead of one long locking statement, safe to run twice, and wait
-  for what you restart to answer before moving on.
+  saw in this session, batches instead of one long locking statement, skip what is already done
+  (a retry must finish the job, also after a crash halfway), and wait for what you restart to
+  answer before moving on.
+- Mind the time: a replay takes as long as the script, plus the retries, and the call waits for
+  it. Know roughly how long the script takes before replaying it in full. For a long operation,
+  pass `sample` (commands that shrink the data) to check the logic in minutes, or
+  `background=true` and collect the result later with `verify_result`. If users are failing now,
+  take the safe step on main first and hand the full change over after.
 """
 
 
