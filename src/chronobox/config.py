@@ -29,6 +29,7 @@ A project commits one file next to its code::
     load_check = "bin/traffic --report" # after it: fails if users saw errors or lost writes
     checks = ["bin/smoke-test"]         # must pass after the script
     compare = ["pg_dump -s -U postgres"] # same output on the agent's machine and the replay
+    sample = ["bin/keep-a-tenth"]       # optional: shrink the data, to check the logic fast
 
 Relative paths are relative to the file's folder. Machines have no network: anything to
 install belongs in the image.
@@ -60,7 +61,7 @@ COMMON_EXCLUDES = (
 TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service", "handoff"})
 MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
 PROJECT_KEYS = frozenset({"path", "target", "exclude"})
-HANDOFF_KEYS = frozenset({"prepare", "load", "load_check", "checks", "compare"})
+HANDOFF_KEYS = frozenset({"prepare", "load", "load_check", "checks", "compare", "sample"})
 IMAGE_KEYS = frozenset({"name", "reference", "dockerfile", "context"})
 SERVICE_KEYS = frozenset(
     {"name", "start", "ready", "env", "workdir", "restart", "ready_timeout", "after_setup"}
@@ -167,6 +168,8 @@ class HandoffSettings:
         checks: Commands that must succeed after the script (and the agent's check).
         compare: Commands whose output must be the same on the machine the agent worked on and on
             the replay, e.g. a schema dump: the script must reproduce what the agent tested.
+        sample: Commands that shrink the replay's data, on every replay (the agent can also pass
+            its own): the logic is checked in minutes, and the report says it ran on a sample.
     """
 
     prepare: tuple[str, ...] = ()
@@ -174,6 +177,7 @@ class HandoffSettings:
     load_check: str = ""
     checks: tuple[str, ...] = ()
     compare: tuple[str, ...] = ()
+    sample: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -354,6 +358,7 @@ def _handoff(table: dict[str, Any]) -> HandoffSettings:
         load_check=table.get("load_check", ""),
         checks=tuple(_list(table, "checks", str)),
         compare=tuple(_list(table, "compare", str)),
+        sample=tuple(_list(table, "sample", str)),
     )
 
 

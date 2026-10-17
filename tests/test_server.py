@@ -1,6 +1,7 @@
 """The MCP server over real stdio, in each of its modes."""
 
 import asyncio
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from chronobox.handoff import handoff_tools
 from chronobox.server import build_server
 from chronobox.service import WorkspaceService, request
 from chronobox.workspace import Profile
@@ -50,10 +52,33 @@ async def test_profiles_expose_only_their_tools() -> None:
         assert {tool.name for tool in await server.list_tools()} == names
     with_handoff = build_server(Profile.CHRONOBOX, call, handoff=True)
     handoff_tools = {tool.name for tool in await with_handoff.list_tools()}
-    assert handoff_tools == expected[Profile.CHRONOBOX] | {"verify_script"}
+    assert handoff_tools == expected[Profile.CHRONOBOX] | {"verify_script", "verify_result"}
     assert "verify_script" in (with_handoff.instructions or "")
     alone = build_server(Profile.ALONE, call, handoff=True)
     assert {tool.name for tool in await alone.list_tools()} == expected[Profile.ALONE]
+
+
+async def test_verify_script_forwards_every_argument_in_order(tmp_path: Path) -> None:
+    """The MCP tool passes its arguments positionally to the hand-off method, which takes them in the
+    same order: a new argument in one place only would shift the others."""
+    calls: list[tuple[object, ...]] = []
+
+    async def call(method: str, *args: object) -> str:
+        """Record the forwarded call."""
+        calls.append((method, *args))
+        return "ok"
+
+    server = build_server(Profile.CHRONOBOX, call, handoff=True)
+    await server.call_tool("verify_script", {"script": "s", "check": "c", "load": "l", "background": True})
+    await server.call_tool("verify_result", {"wait": 5})
+    assert calls == [
+        ("verify_script", "s", "c", "", "", "", "l", "", "", True, True, "main", "start", 900),
+        ("verify_result", "", 5),
+    ]
+    methods = handoff_tools(None, None, exports=tmp_path)  # type: ignore[arg-type]
+    for name in ("verify_script", "verify_result"):
+        tool = server._tool_manager.get_tool(name)
+        assert list(inspect.signature(methods[name]).parameters) == list(tool.parameters["properties"])
 
 
 @pytest.mark.vm
