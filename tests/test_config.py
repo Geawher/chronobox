@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from chronobox.config import DEFAULT_EXCLUDES, ConfigError, load_config, starter_config
+from chronobox.config import DEFAULT_EXCLUDES, ConfigError, HandoffSettings, load_config, starter_config
 from chronobox.images import DEFAULT_IMAGE
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "notes"
@@ -25,6 +25,7 @@ def test_the_example_project_reads_as_written() -> None:
     assert config.services[1].ready.startswith("curl")
     assert config.setup == ("python3 migrate.py",)
     assert config.exclude == (*DEFAULT_EXCLUDES, "__pycache__")
+    assert config.handoff.load == "python3 traffic.py" and len(config.handoff.compare) == 2
 
 
 def test_defaults_for_a_minimal_file(tmp_path: Path) -> None:
@@ -73,6 +74,26 @@ after_setup = true
     assert app.after_setup
 
 
+def test_handoff_settings_read_as_written_and_default_to_nothing(tmp_path: Path) -> None:
+    """``[handoff]`` keeps its commands in order; without it a replay adds nothing."""
+    assert load_config(write(tmp_path, "")).handoff == HandoffSettings()
+    text = """
+[handoff]
+prepare = ["bin/more-data"]
+load = "bin/traffic"
+load_check = "bin/traffic --report"
+checks = ["bin/smoke", "bin/api-test"]
+compare = ["pg_dump -s"]
+"""
+    handoff = load_config(write(tmp_path, text)).handoff
+    assert handoff.prepare == ("bin/more-data",) and handoff.checks == ("bin/smoke", "bin/api-test")
+    assert (handoff.load, handoff.load_check, handoff.compare) == (
+        "bin/traffic",
+        "bin/traffic --report",
+        ("pg_dump -s",),
+    )
+
+
 @pytest.mark.parametrize(
     ("text", "message"),
     [
@@ -90,6 +111,10 @@ after_setup = true
         ("[[service]]\nname = 'web api'\nstart = 'x'\n", "service name"),
         ("[[service]]\nname = 'a;rm'\nstart = 'x'\n", "service name"),
         ("[[service]]\nname = 'a'\nstart = 'x'\nenv = { 'A B' = 'x' }\n", "bad env variable names"),
+        ("[handoff]\nchecks = 'make test'\n", "checks must be a list of str"),
+        ("[handoff]\nload = ['a']\n", "handoff.load must be a string"),
+        ("[handoff]\nload_check = 'x'\n", "load_check needs handoff.load"),
+        ("[handoff]\nsmoke = 'x'\n", "unknown keys in handoff: smoke"),
     ],
 )
 def test_mistakes_are_reported_clearly(tmp_path: Path, text: str, message: str) -> None:

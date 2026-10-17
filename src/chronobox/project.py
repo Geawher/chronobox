@@ -507,8 +507,9 @@ def project_note(config: ProjectConfig, *, with_handoff: bool = False) -> str:
         return note
     return (
         f"{note} When a change needs actions beyond file edits (a migration, restarts, settings "
-        "outside the project), write them as a script and check it with `verify_script`, which "
-        "replays it on a fresh fork and saves it with the patch for the user."
+        "outside the project), the user needs a script: check it with `verify_script`, which replays "
+        "it on a fresh fork with the project's checks and saves it with the patch; what it saved is "
+        "the hand-off."
     )
 
 

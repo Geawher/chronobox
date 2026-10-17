@@ -23,6 +23,13 @@ A project commits one file next to its code::
     ready = "pg_isready -h 127.0.0.1"
     env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 
+    [handoff]                           # what `verify_script` adds to every replay
+    prepare = ["bin/more-data"]         # make the replay fork look like production first
+    load = "bin/traffic"                # runs during the replay, like real users
+    load_check = "bin/traffic --report" # after it: fails if users saw errors or lost writes
+    checks = ["bin/smoke-test"]         # must pass after the script
+    compare = ["pg_dump -s -U postgres"] # same output on the agent's machine and the replay
+
 Relative paths are relative to the file's folder. Machines have no network: anything to
 install belongs in the image.
 """
@@ -50,9 +57,10 @@ COMMON_EXCLUDES = (
     "node_modules", ".venv", "venv", "__pycache__", "target", "dist",
     ".pytest_cache", ".mypy_cache", ".ruff_cache",
 )  # fmt: skip
-TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service"})
+TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service", "handoff"})
 MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
 PROJECT_KEYS = frozenset({"path", "target", "exclude"})
+HANDOFF_KEYS = frozenset({"prepare", "load", "load_check", "checks", "compare"})
 IMAGE_KEYS = frozenset({"name", "reference", "dockerfile", "context"})
 SERVICE_KEYS = frozenset(
     {"name", "start", "ready", "env", "workdir", "restart", "ready_timeout", "after_setup"}
@@ -144,6 +152,31 @@ class Service:
 
 
 @dataclass(frozen=True)
+class HandoffSettings:
+    """What the project adds to every ``verify_script`` replay (the ``[handoff]`` table), so a
+    hand-off is checked against what the project's owner knows about production, not only against
+    the agent's own check.
+
+    Attributes:
+        prepare: Commands run on the replay fork before anything else, e.g. to load more or odder
+            data, so it looks more like production than the agent's copy.
+        load: A command started in the background before the script and stopped after the checks:
+            traffic like the real users'.
+        load_check: Run once ``load`` is stopped; fails if the users had a problem (errors, lost
+            writes).
+        checks: Commands that must succeed after the script (and the agent's check).
+        compare: Commands whose output must be the same on the machine the agent worked on and on
+            the replay, e.g. a schema dump: the script must reproduce what the agent tested.
+    """
+
+    prepare: tuple[str, ...] = ()
+    load: str = ""
+    load_check: str = ""
+    checks: tuple[str, ...] = ()
+    compare: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ProjectConfig:
     """A parsed ``chronobox.toml``.
 
@@ -160,6 +193,7 @@ class ProjectConfig:
         disk_mib: Writable disk.
         vcpus: Virtual CPUs.
         command_timeout: Default timeout of one command, in seconds.
+        handoff: What ``verify_script`` adds to every replay.
     """
 
     file: Path
@@ -174,6 +208,7 @@ class ProjectConfig:
     disk_mib: int = DEFAULT_DISK_MIB
     vcpus: int = 2
     command_timeout: float = 300.0
+    handoff: HandoffSettings = HandoffSettings()
 
 
 def find_config(project: Path) -> Path:
@@ -218,6 +253,7 @@ def load_config(project: Path) -> ProjectConfig:
         disk_mib=int(machine.get("disk_mib", DEFAULT_DISK_MIB)),
         vcpus=int(machine.get("vcpus", 2)),
         command_timeout=float(machine.get("command_timeout", 300.0)),
+        handoff=_handoff(_table(raw, "handoff", HANDOFF_KEYS)),
     )
 
 
@@ -298,6 +334,26 @@ def _service(entry: dict[str, Any]) -> Service:
         restart=bool(entry.get("restart", True)),
         ready_timeout=float(entry.get("ready_timeout", DEFAULT_READY_TIMEOUT_S)),
         after_setup=bool(entry.get("after_setup", False)),
+    )
+
+
+def _handoff(table: dict[str, Any]) -> HandoffSettings:
+    """Read the ``[handoff]`` table.
+
+    Raises:
+        ConfigError: If a command list is not a list of strings, or ``load_check`` comes without ``load``.
+    """
+    for key in ("load", "load_check"):
+        if not isinstance(table.get(key, ""), str):
+            raise ConfigError(f"handoff.{key} must be a string")
+    if table.get("load_check") and not table.get("load"):
+        raise ConfigError("handoff.load_check needs handoff.load")
+    return HandoffSettings(
+        prepare=tuple(_list(table, "prepare", str)),
+        load=table.get("load", ""),
+        load_check=table.get("load_check", ""),
+        checks=tuple(_list(table, "checks", str)),
+        compare=tuple(_list(table, "compare", str)),
     )
 
 
