@@ -48,6 +48,12 @@ async def test_profiles_expose_only_their_tools() -> None:
     for profile, names in expected.items():
         server = build_server(profile, call)
         assert {tool.name for tool in await server.list_tools()} == names
+    with_handoff = build_server(Profile.CHRONOBOX, call, handoff=True)
+    handoff_tools = {tool.name for tool in await with_handoff.list_tools()}
+    assert handoff_tools == expected[Profile.CHRONOBOX] | {"verify_script"}
+    assert "verify_script" in (with_handoff.instructions or "")
+    alone = build_server(Profile.ALONE, call, handoff=True)
+    assert {tool.name for tool in await alone.list_tools()} == expected[Profile.ALONE]
 
 
 @pytest.mark.vm
