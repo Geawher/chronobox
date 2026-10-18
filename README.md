@@ -162,8 +162,8 @@ claude mcp add chronobox -- chronobox mcp --project .
     whole job), and when killed midway and run again, on copies of the replay snapshotted while
     it ran (deployments get retried, sometimes after a crash);
   - the agent's `check` passes (it is required), and the project's checks;
-  - the traffic run during the replay (the project's, and the agent's own `load`) lost nothing
-    (`load_check`);
+  - the traffic during the replay (the project's, the agent's own `load`, or the machine's own
+    clients) lost nothing (`load_check`);
   - every service still answers its `ready` command, and a project process the agent restarted
     on its machine was restarted by the script too.
 
@@ -171,8 +171,9 @@ claude mcp add chronobox -- chronobox mcp --project .
   on, run first: you stop if it fails), `pre` (before the new files, with the old code running)
   and `rollback` (once the old files are back). `sample` shrinks the replay's data so a long
   operation's logic is checked in minutes (the report says it ran on a sample), and
-  `background=true` returns at once, the result coming from `verify_result`. Then the patch, the
-  scripts and the replay's report are saved in `.chronobox/exports/handoff/`, ready for the real
+  `background=true` returns at once, the result coming from `verify_result` (a replay still going
+  after 5 minutes goes on in the background the same way). Then the patch, the scripts and the
+  replay's report, which starts with what the replay showed, are saved in `.chronobox/exports/handoff/`, ready for the real
   machine; a failed replay withdraws the hand-off saved before (to `handoff-withdrawn/`).
 - **`[handoff]`**: what you know about production, added to every replay so the agent's own check
   is not the only one:
@@ -185,7 +186,13 @@ claude mcp add chronobox -- chronobox mcp --project .
   checks = ["bin/smoke-test"]           # must pass after the script
   compare = ["pg_dump -s -U postgres"]  # same output on the agent's machine and on the replay
   sample = ["bin/keep-a-tenth"]         # optional: every replay on a sample of the data
+  review = "claude -p --model claude-haiku-4-5"  # optional: a second opinion on the agent's check
   ```
+
+  `review` runs on your machine after each passed replay, with the user's goal, the scripts, the
+  check and the report on its stdin. It answers `OK` or up to three ways the change could be wrong
+  while the check passes, and the agent sees them. It only advises: the hand-off is saved either
+  way.
 
   `compare` catches a script that does not reproduce what the agent tested (a column it added
   by hand, a setting it forgot); the [example](examples/notes/chronobox.toml) compares the schema

@@ -196,6 +196,7 @@ def build_server(
         code_from: str = MAIN,
         checkpoint: str = "start",
         timeout: float = 900,
+        goal: str = "",
     ) -> str:
         """Check a change script the way the user will run it on the real machine, and hand it over
         with the patch: what it saves in .chronobox/exports/handoff/ is what the user runs, as
@@ -216,12 +217,18 @@ def build_server(
 
         `check` is required and decides whether you are done: a command that fails unless the change
         works the way the user asked, used as users would (call the new endpoint, insert a new row and
-        read it back). It runs after the script, so it cannot see what users went through during it:
+        read it back). Before writing it, ask what would make the change wrong on the real machine
+        and make the check fail then: writes while the script runs; rows that arrive after it;
+        data the logic gets wrong (records that look alike but are not the same, nulls, other
+        owners); effects that come later (scheduled jobs, compaction, caches); more data than here.
+        It runs after the script, so it cannot see what users went through during it:
         when the change could lose or block writes (restarts, failovers, migrations under traffic),
-        pass `load` (writes like the users', each logged when acknowledged) and `load_check` (fails if
-        an acknowledged write is missing or requests failed).
+        pass `load_check` (fails if an acknowledged write is missing or requests failed), and `load`
+        (writes like the users', each logged when acknowledged) unless the machine's own clients
+        already write and log: they keep running on the replay.
 
-        Time: a replay takes as long as the script, plus the retries, and this call waits for it.
+        Time: a replay takes as long as the script, plus the retries; this call waits up to 5 minutes,
+        then leaves it running and tells you to collect it with `verify_result`.
         Know roughly how long the script takes before replaying it in full (from main, or a sample).
         For a long operation pass `sample` to check the logic in minutes (the report says it ran on a
         sample), or background=true to keep working and collect the result with `verify_result`. If
@@ -230,10 +237,12 @@ def build_server(
         Pass the scripts' text, not paths. Write them for the real machine, which has more data and
         live users: no values you only saw in this session, no long locks, skip what is already done
         so a retry is quick, and wait for what you restart to answer. On failure nothing is saved and
-        the hand-off saved before is withdrawn. `timeout` limits each run of a script, in seconds."""
+        the hand-off saved before is withdrawn. `timeout` limits each run of a script, in seconds.
+        `goal` is what the user asked, in their words: a project reviewer, if set, checks your
+        check against it."""
         return await call(
             "verify_script", script, check, pre, rollback, assume, load, load_check, sample,
-            twice, background, code_from, checkpoint, timeout,
+            twice, background, code_from, checkpoint, timeout, goal,
         )  # fmt: skip
 
     async def verify_result(fork: str = "", wait: float = 0) -> str:
