@@ -239,7 +239,7 @@ def build_server(
         so a retry is quick, and wait for what you restart to answer. On failure nothing is saved and
         the hand-off saved before is withdrawn. `timeout` limits each run of a script, in seconds.
         `goal` is what the user asked, in their words: a project reviewer, if set, checks your
-        check against it."""
+        check against it (then it is required)."""
         return await call(
             "verify_script", script, check, pre, rollback, assume, load, load_check, sample,
             twice, background, code_from, checkpoint, timeout, goal,
