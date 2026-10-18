@@ -84,8 +84,10 @@ load = "bin/traffic"
 load_check = "bin/traffic --report"
 checks = ["bin/smoke", "bin/api-test"]
 compare = ["pg_dump -s"]
+review = "claude -p"
 """
     handoff = load_config(write(tmp_path, text)).handoff
+    assert handoff.review == "claude -p"
     assert handoff.prepare == ("bin/more-data",) and handoff.checks == ("bin/smoke", "bin/api-test")
     assert (handoff.load, handoff.load_check, handoff.compare) == (
         "bin/traffic",
@@ -113,7 +115,7 @@ compare = ["pg_dump -s"]
         ("[[service]]\nname = 'a'\nstart = 'x'\nenv = { 'A B' = 'x' }\n", "bad env variable names"),
         ("[handoff]\nchecks = 'make test'\n", "checks must be a list of str"),
         ("[handoff]\nload = ['a']\n", "handoff.load must be a string"),
-        ("[handoff]\nload_check = 'x'\n", "load_check needs handoff.load"),
+        ("[handoff]\nreview = ['claude']\n", "handoff.review must be a string"),
         ("[handoff]\nsmoke = 'x'\n", "unknown keys in handoff: smoke"),
     ],
 )

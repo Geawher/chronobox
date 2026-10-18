@@ -120,9 +120,50 @@ BASHISMS = {
 }
 NO_TRAFFIC_NOTE = (
     "nothing checked what users saw while the script ran (no load_check): if the change can lose or "
-    "block writes (restarts, failovers, migrations under traffic), pass load and load_check; a check "
-    "after the script cannot see what happened during it"
+    "block writes (restarts, failovers, migrations under traffic), pass load_check (and load, unless "
+    "the machine's own clients already write); a check after the script cannot see what happened during it"
 )
+# Steps whose passing the summary at the top of the report lists.
+SHOWN_CHECKS = ("check `", "[handoff] check `", "load_check `", "[handoff] load_check `")
+LOAD_CHECK_LABEL = "load_check `"
+SAMPLE_CAVEAT = "the logic was checked, not the time or locks at full size"
+# A failed replay whose script ran this long gets a hint to check the logic on a sample first.
+SLOW_REPLAY_S = 120.0
+# A reviewer (``[handoff] review``) gets this long to answer; its first line is OK when it sees no gap.
+REVIEW_TIMEOUT_S = 300.0
+REVIEW_OK = "OK"
+REVIEW_PROMPT = """You review a change script before it runs on a production machine. \
+It passed a replay on a copy of the machine, judged by the check below. Your job: find ways \
+the change could still be wrong on production while that check passes.
+
+What the user asked:
+{goal}
+
+The scripts (run as ./apply.sh on production; assume.sh first, if any):
+{scripts}
+
+The check that has to prove the change works:
+{check}
+
+Traffic during the replay: {load}
+Traffic check after it: {load_check}
+
+The replay's report:
+{report}
+
+Look for what the check does not test, in particular:
+- writes by users while the script runs (lost, blocked, or missed by a backfill);
+- rows or requests that arrive after the script (do they get the new behaviour?);
+- data the script's logic gets wrong: records that look alike but are not the same, nulls, \
+  other owners, values production has and the copy may not;
+- effects that come later: scheduled jobs, compaction, caches, the next restart;
+- production being bigger or different from the copy.
+
+Answer in plain text. If the check covers what the user asked, the first line is exactly OK. \
+Otherwise list at most 3 gaps, most likely first, each as: the gap in one sentence, then a shell \
+command the check could add to catch it."""
+# verify_script waits this long for a replay, then leaves it running in the background.
+FOREGROUND_WAIT_S = 300.0
 # Each line: port, pid, working folder and command line of a process listening on TCP. Only bash,
 # awk and coreutils, which any image has: sockets from /proc/net/tcp*, their owners from /proc/*/fd.
 LISTENERS = r"""
@@ -253,10 +294,31 @@ class Replay:
         """Every step and check passed."""
         return not self.problems
 
+    def showed(self) -> list[str]:
+        """What the steps of a passed replay showed, for whoever reviews the hand-off."""
+        shown = [f"on a sample of the data ({SAMPLE_CAVEAT})"] if self.sampled else []
+        for step in self.steps:
+            label = step.label
+            if label == ASSUME_FILE:
+                shown.append(f"./{ASSUME_FILE} passed on the copy (the user runs it first on production)")
+            elif label == SCRIPT_FILE:
+                shown.append(f"./{SCRIPT_FILE} finished in {step.seconds:.1f} s")
+            elif label == f"{SCRIPT_FILE} (second run)":
+                shown.append(f"run again right after, it finished in {step.seconds:.1f} s")
+            elif label.startswith("[killed") and label.endswith("(run again)"):
+                shown.append(f"{label.split(']')[0].lstrip('[')}: it then finished the job")
+            elif label.startswith("load `"):
+                shown.append(f"traffic during the script: {label.removesuffix(' (started)')}")
+            elif label.startswith(SHOWN_CHECKS):
+                shown.append(f"passed: {label}")
+        if not any(LOAD_CHECK_LABEL in step.label for step in self.steps):
+            shown.append("not checked: what users saw while the script ran (no load_check)")
+        return shown
+
     def report(self) -> str:
         """The replay as text, for the agent and for ``replay.txt``."""
         verdict = "passed" if self.succeeded else "FAILED"
-        sample = " ON A SAMPLE of the data (the logic was checked, not the time or locks at full size)"
+        sample = f" ON A SAMPLE of the data ({SAMPLE_CAVEAT})"
         lines = [
             f"replayed on fork {self.fork!r} (from checkpoint {self.checkpoint!r}, project files "
             f"from {self.code_from}){sample if self.sampled else ''}: {verdict}"
@@ -267,6 +329,8 @@ class Replay:
                 f"--- {step.label}: exit {step.code} after {step.seconds:.1f} s",
                 _shorten(step.output, limit),
             ]
+        if self.succeeded:
+            lines[1:1] = ["--- what this replay showed", *(f"- {line}" for line in self.showed())]
         if self.problems:
             lines += ["--- problems", *(f"- {problem}" for problem in self.problems)]
         if self.notes:
@@ -617,9 +681,10 @@ class ReplayRun:
 
     async def _load_checks(self, note_traffic: bool) -> None:
         """Each traffic check, once the traffic stopped; a note when none watched the users."""
+        traffic = "your traffic" if self.options.load else "the machine's traffic"
         checks = [
             ("[handoff] load_check", self.settings.load_check, "the project's traffic"),
-            ("load_check", self.options.load_check, "your traffic"),
+            ("load_check", self.options.load_check, traffic),
         ]
         for label, command, whose in checks:
             if command and (await self.step(f"{label} `{command}`", command)).code != 0:
@@ -924,8 +989,9 @@ def handoff_tools(
     target = project.config.target if project is not None else "/root"
     replays: dict[str, tuple[asyncio.Task[str], Replay]] = {}
 
-    async def replay_and_save(scripts: Scripts, replay: Replay, options: Options) -> str:
-        """Replay; on success save the hand-off, on failure withdraw the one saved before."""
+    async def replay_and_save(scripts: Scripts, replay: Replay, options: Options, goal: str) -> str:
+        """Replay; on success (and the review, if any) save the hand-off, on failure withdraw the
+        one saved before."""
         try:
             await replay_script(workspace, project, settings, scripts, replay, options)
             report = replay.report()
@@ -933,8 +999,11 @@ def handoff_tools(
                 gone = withdraw_handoff(folder, withdrawn)
                 note = f" The hand-off saved before was withdrawn (moved to {withdrawn})." if gone else ""
                 fix = "fix the script (or the project files) and verify it again"
+                fix += _slow_hint(replay, options)
                 return f"{report}\nnot saved: {fix}.{note}"
             patch = await project.patch(workspace, replay.code_from) if project is not None else ""
+            if settings.review:
+                report += "\n" + await review(settings.review, goal, scripts, options, report)
             report = f"{how_to_run(scripts, bool(patch), target)}\n{report}"
             saved = save_handoff(folder, scripts, patch, report)
         except (WorkspaceError, VMError, ProjectError, tarfile.TarError, OSError) as error:
@@ -962,6 +1031,7 @@ def handoff_tools(
         code_from: str = MAIN,
         checkpoint: str = START,
         timeout: float = DEFAULT_SCRIPT_TIMEOUT_S,
+        goal: str = "",
     ) -> str:
         """Replay the hand-off and save or withdraw it; in the background, only start the replay."""
         if not script.strip():
@@ -973,20 +1043,25 @@ def handoff_tools(
             )
         if code_from == LOCAL and project is None:
             return "error: code_from='local' needs a project"
-        if load_check.strip() and not load.strip() and not settings.load:
-            return "error: load_check checks the traffic `load` runs during the replay: pass load too"
         scripts = Scripts(script, pre, rollback, assume)
         timeout = min(max(float(timeout), 1.0), MAX_SCRIPT_TIMEOUT_S)
         options = Options(check, load, load_check, sample, bool(twice), timeout)
         replay = Replay(_free_fork_name(workspace, replays), checkpoint, code_from)
-        task = asyncio.create_task(replay_and_save(scripts, replay, options))
+        task = asyncio.create_task(replay_and_save(scripts, replay, options, goal))
         replays[replay.fork] = (task, replay)
         if background:
             return (
                 f"replaying in the background on fork {replay.fork!r}; keep working, then call "
                 f"verify_result(fork={replay.fork!r}) for the result (it can wait for it)"
             )
-        await asyncio.shield(task)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), FOREGROUND_WAIT_S)
+        except TimeoutError:
+            return (
+                f"still replaying after {FOREGROUND_WAIT_S:.0f} s, now at: {replay.current}. Nothing is "
+                f"saved until it passes: keep working, then call verify_result(fork={replay.fork!r}, "
+                "wait=...) for the result"
+            )
         return await collect(replay.fork)
 
     async def verify_result(fork: str = "", wait: float = 0) -> str:
@@ -1005,6 +1080,55 @@ def handoff_tools(
         return await collect(name)
 
     return {"verify_script": verify_script, "verify_result": verify_result}
+
+
+async def review(command: str, goal: str, scripts: Scripts, options: Options, report: str) -> str:
+    """Ask the project's reviewer (a command on the host, the prompt on its stdin) what the check
+    misses; its answer, as a report section, with what to do about it.
+
+    The reviewer only advises: the hand-off is saved either way, and a reviewer that fails or does
+    not answer in time is reported as such.
+    """
+    prompt = REVIEW_PROMPT.format(
+        goal=goal.strip() or "(not given: judge from the scripts and the check)",
+        scripts="\n".join(f"--- {name}\n{text}" for name, text in scripts.files().items()),
+        check=options.check, load=options.load or "(none of the agent's)",
+        load_check=options.load_check or "(none)", report=report,
+    )  # fmt: skip
+    header = f"--- review (by `{command}`)"
+    try:
+        process = await asyncio.create_subprocess_shell(
+            command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )  # fmt: skip
+        output, _ = await asyncio.wait_for(process.communicate(prompt.encode()), REVIEW_TIMEOUT_S)
+    except TimeoutError:
+        process.kill()
+        return f"{header}\nthe reviewer did not answer within {REVIEW_TIMEOUT_S:.0f} s"
+    except OSError as error:
+        return f"{header}\nthe reviewer could not run: {error}"
+    answer = output.decode(errors="replace").strip()
+    if process.returncode != 0:
+        failed = _shorten(answer, STEP_OUTPUT_LIMIT)
+        return f"{header}\nthe reviewer failed (exit {process.returncode}): {failed}"
+    if answer.splitlines()[:1] == [REVIEW_OK]:
+        return f"{header}\n{REVIEW_OK}: no gap found in the check"
+    return (
+        f"{header}\n{_shorten(answer, OUTPUT_LIMIT)}\nThe hand-off is saved, but the reviewer thinks the "
+        "check may miss the above: if a gap is real, make the check (or load_check) catch it, fix the "
+        "script if needed, and verify again"
+    )
+
+
+def _slow_hint(replay: Replay, options: Options) -> str:
+    """For a slow failed replay of the full data: how to check the logic faster ("" otherwise)."""
+    first = next((step for step in replay.steps if step.label == SCRIPT_FILE), None)
+    if replay.sampled or options.sample or first is None or first.seconds < SLOW_REPLAY_S:
+        return ""
+    return (
+        f". The script ran {first.seconds:.0f} s here: check the logic on a sample first (sample= "
+        "commands that shrink the data, e.g. delete most rows), then replay the full data once it passes"
+    )
 
 
 def _free_fork_name(workspace: Workspace, taken: dict[str, object]) -> str:

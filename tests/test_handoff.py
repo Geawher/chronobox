@@ -21,8 +21,12 @@ from chronobox.handoff import (
     ROLLBACK_FILE,
     SCRIPT_FILE,
     WITHDRAWN_DIR,
+    Options,
+    Replay,
     Scripts,
+    Step,
     _file_names,
+    _slow_hint,
     bash_features,
     difference,
     handoff_tools,
@@ -80,6 +84,44 @@ def test_how_to_run_lists_the_scripts_in_order() -> None:
     order = [text.index(part) for part in (ASSUME_FILE, PRE_FILE, PATCH_FILE, f"./{SCRIPT_FILE}")]
     assert order == sorted(order) and "/src" in text and ROLLBACK_FILE in text
     assert PATCH_FILE not in how_to_run(Scripts("echo go"), False, "/root")
+
+
+def test_a_passed_replay_starts_with_what_it_showed() -> None:
+    """The reviewer reads first what the replay showed: runs, retries, traffic and checks passed, and
+    what was not checked; a failed replay has no such summary."""
+    replay = Replay("replay-1", "start", MAIN)
+    replay.steps = [
+        Step("load `bin/traffic` (started)", 0, "", 0.1),
+        Step(SCRIPT_FILE, 0, "", 12.0),
+        Step(f"{SCRIPT_FILE} (second run)", 0, "", 0.4),
+        Step(f"[killed 9 s in and run again] {SCRIPT_FILE} (run again)", 0, "", 5.0),
+        Step("check `curl -sf /new`", 0, "", 0.2),
+        Step("load_check `bin/traffic --report`", 0, "", 0.1),
+    ]
+    summary = replay.report().split("--- what this replay showed\n")[1].split("\n---")[0]
+    assert summary.splitlines() == [
+        "- traffic during the script: load `bin/traffic`",
+        f"- ./{SCRIPT_FILE} finished in 12.0 s",
+        "- run again right after, it finished in 0.4 s",
+        "- killed 9 s in and run again: it then finished the job",
+        "- passed: check `curl -sf /new`",
+        "- passed: load_check `bin/traffic --report`",
+    ], summary
+    replay.steps = replay.steps[1:3]
+    assert "not checked: what users saw while the script ran" in replay.report()
+    replay.problems.append("your check failed")
+    assert "what this replay showed" not in replay.report()
+
+
+def test_a_slow_failed_replay_suggests_checking_the_logic_on_a_sample() -> None:
+    """Only a full-data replay whose script ran for minutes gets the hint."""
+    options = Options("true", "", "", "", True, 900.0)
+    slow, quick = Replay("replay-1", "start", MAIN), Replay("replay-2", "start", MAIN)
+    slow.steps, quick.steps = [Step(SCRIPT_FILE, 1, "", 300.0)], [Step(SCRIPT_FILE, 1, "", 5.0)]
+    assert "check the logic on a sample first" in _slow_hint(slow, options)
+    assert _slow_hint(quick, options) == ""
+    slow.sampled = True
+    assert _slow_hint(slow, options) == ""
 
 
 def test_file_names_are_relative_to_the_project_whatever_the_archive_prefix() -> None:
@@ -363,7 +405,8 @@ async def test_assumptions_traffic_and_samples_are_part_of_the_replay(
     assert f"{ASSUME_FILE} failed on the replay" in unmet, unmet
     lost = await verify("true", check="true", load=load, load_check="false")
     assert "your traffic saw a problem" in lost, lost
-    assert "pass load too" in await verify("true", check="true", load_check="true")
+    own = await verify("true", check="true", load_check="false")
+    assert "the machine's traffic saw a problem" in own, own
 
 
 @pytest.mark.vm
@@ -379,3 +422,48 @@ async def test_a_replay_in_the_background_is_collected_with_verify_result(
     done = await tools["verify_result"]("replay-1", 120)
     assert "passed" in done and "hand-off saved" in done, done
     assert "no replay is waiting" in await tools["verify_result"]()
+
+
+@pytest.mark.vm
+async def test_a_long_replay_goes_on_in_the_background_after_the_foreground_wait(
+    bare: tuple[Workspace, dict[str, Method]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """verify_script stops waiting after ``FOREGROUND_WAIT_S`` (1 s here) and says how to collect the
+    replay, which goes on and is then given by ``verify_result``."""
+    monkeypatch.setattr(handoff, "FOREGROUND_WAIT_S", 1.0)
+    _, tools = bare
+    reply = await tools["verify_script"]("sleep 4", check="true", twice=False)
+    assert "still replaying after 1 s" in reply and "verify_result(fork='replay-1'" in reply, reply
+    done = await tools["verify_result"]("replay-1", 120)
+    assert "passed" in done and "hand-off saved" in done, done
+
+
+@pytest.mark.vm
+async def test_a_passed_handoff_is_reviewed_and_the_gaps_are_shown(tmp_path: Path) -> None:
+    """The project's reviewer gets the goal, the scripts and the check on stdin; a gap it reports is
+    shown and kept in replay.txt (the hand-off is saved anyway), an OK says no gap was found."""
+    prompt = tmp_path / "prompt.txt"
+    gaps = f"cat > {prompt}; echo 'new rows written after the script get no title'"
+    backend = FirecrackerBackend(tmp_path / "vms")
+    workspace = Workspace(backend, MachineSpec(setup=("echo old > /etc/app.conf",)))
+    await workspace.start()
+    try:
+        for review, expected in (
+            (gaps, "the reviewer thinks the check may miss"),
+            ("cat >/dev/null; echo OK", "OK: no gap found"),
+        ):
+            settings = HandoffSettings(review=review)
+            tools = handoff_tools(workspace, None, settings=settings, exports=tmp_path / "out")
+            reply = await tools["verify_script"](
+                "sed -i s/old/new/ /etc/app.conf", check="grep -qx new /etc/app.conf", twice=False,
+                goal="switch the app to new",
+            )  # fmt: skip
+            assert expected in reply and "hand-off saved" in reply, reply
+        asked = prompt.read_text()
+        assert "switch the app to new" in asked and "grep -qx new /etc/app.conf" in asked
+        assert "sed -i s/old/new/ /etc/app.conf" in asked
+        report = (tmp_path / "out" / "handoff" / REPORT_FILE).read_text()
+        assert "--- review (by `cat >/dev/null; echo OK`)" in report
+    finally:
+        await workspace.close()
+        await backend.cleanup()
