@@ -1041,6 +1041,11 @@ def handoff_tools(
                 "error: a check is required: a command that fails unless the change works as the user "
                 "asked (use it as users would, including new writes), run after the script"
             )
+        if settings.review and not goal.strip():
+            return (
+                "error: this project reviews each hand-off's check against what the user asked: pass "
+                "goal, the user's request in their words"
+            )
         if code_from == LOCAL and project is None:
             return "error: code_from='local' needs a project"
         scripts = Scripts(script, pre, rollback, assume)

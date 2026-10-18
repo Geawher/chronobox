@@ -459,6 +459,7 @@ async def test_a_passed_handoff_is_reviewed_and_the_gaps_are_shown(tmp_path: Pat
                 goal="switch the app to new",
             )  # fmt: skip
             assert expected in reply and "hand-off saved" in reply, reply
+            assert "pass goal" in await tools["verify_script"]("true", check="true")
         asked = prompt.read_text()
         assert "switch the app to new" in asked and "grep -qx new /etc/app.conf" in asked
         assert "sed -i s/old/new/ /etc/app.conf" in asked
