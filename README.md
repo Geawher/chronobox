@@ -186,13 +186,14 @@ claude mcp add chronobox -- chronobox mcp --project .
   checks = ["bin/smoke-test"]           # must pass after the script
   compare = ["pg_dump -s -U postgres"]  # same output on the agent's machine and on the replay
   sample = ["bin/keep-a-tenth"]         # optional: every replay on a sample of the data
-  review = "claude -p --model claude-haiku-4-5"  # optional: a second opinion on the agent's check
+  review = "claude -p --model claude-sonnet-5-5"  # optional: a second opinion on the agent's check
   ```
 
   `review` runs on your machine after each passed replay, with the user's goal, the scripts, the
-  check and the report on its stdin. It answers `OK` or up to three ways the change could be wrong
-  while the check passes, and the agent sees them. It only advises: the hand-off is saved either
-  way.
+  check and the report on its stdin. It answers `OK`, or `GAP` and up to two ways the change is
+  likely to be wrong while the check passes, and the agent sees them. It only advises: the hand-off
+  is saved either way. Use a strong model: in our tests Haiku flagged almost every hand-off, good or
+  bad, while Sonnet flagged 74% of the hand-offs that later failed and 22% of those that worked.
 
   `compare` catches a script that does not reproduce what the agent tested (a column it added
   by hand, a setting it forgot); the [example](examples/notes/chronobox.toml) compares the schema
