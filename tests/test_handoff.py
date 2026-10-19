@@ -360,7 +360,8 @@ async def test_a_script_killed_midway_must_finish_the_job_when_run_again(
 ) -> None:
     """Copies of the replay taken while the script runs (at about 3 s and 10 s) kill it and run it
     again: a script that cannot pick up a half-done job fails there, although it passed when run
-    again after it finished; the failing copy stays open. A script that resumes passes."""
+    again after it finished; the failing copy stays open until the next replay. A script that resumes
+    passes."""
     workspace, tools = bare
     fragile = await tools["verify_script"](FRAGILE, check="test -e /root/done")
     assert "(second run): exit 0" in fragile and "not saved" in fragile, fragile
@@ -370,6 +371,7 @@ async def test_a_script_killed_midway_must_finish_the_job_when_run_again(
     retried = re.findall(r"\[killed \d+ s in and run again\] apply.sh \(run again\): exit 0", resumable)
     assert "passed" in resumable and len(retried) == 2, resumable
     assert not any("replay-2-crash" in fork for fork in workspace.forks)
+    assert not any(fork.startswith("replay-1") for fork in workspace.forks), "earlier replays are closed"
 
 
 @pytest.mark.vm

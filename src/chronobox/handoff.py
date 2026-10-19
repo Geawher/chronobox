@@ -43,7 +43,7 @@ import shutil
 import tarfile
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -73,6 +73,7 @@ LOCAL = "local"  # code_from: the project folder on the host, as the agent edite
 STATE_DIR = "/root/.chronobox"
 LOAD_LOG_DIR = "/var/log/chronobox"
 REPLAY_FORK = "replay"
+CRASH_SUFFIX = "-crash-"
 SHEBANG = "#!"
 DEFAULT_SHEBANG = "#!/bin/sh"
 SH_INTERPRETERS = frozenset({"sh", "dash", "ash"})
@@ -268,7 +269,7 @@ class Replay:
     """What happened when a hand-off was replayed on a fork.
 
     Attributes:
-        fork: The fork it ran on; it stays open for inspection.
+        fork: The fork it ran on; it stays open for inspection until the next replay starts.
         checkpoint: The checkpoint (or fork) it started from.
         code_from: Where the deployed project files came from (a machine, or ``local``).
         steps: Every command run, in order.
@@ -636,7 +637,7 @@ class ReplayRun:
     ) -> tuple[float, Replay]:
         """A copy of the replay at ``point``, where the script is killed and run again. The copy is
         stopped unless something failed there; then it stays open for inspection."""
-        name = f"{self.replay.fork}-crash-{number}"
+        name = f"{self.replay.fork}{CRASH_SUFFIX}{number}"
         crash = Replay(name, self.replay.fork, self.replay.code_from)
         backend = self.workspace.backend
         try:
@@ -988,6 +989,7 @@ def handoff_tools(
     folder, withdrawn = exports / HANDOFF_DIR.name, exports / WITHDRAWN_DIR.name
     target = project.config.target if project is not None else "/root"
     replays: dict[str, tuple[asyncio.Task[str], Replay]] = {}
+    numbers = itertools.count(1)
 
     async def replay_and_save(scripts: Scripts, replay: Replay, options: Options, goal: str) -> str:
         """Replay; on success (and the review, if any) save the hand-off, on failure withdraw the
@@ -1051,7 +1053,8 @@ def handoff_tools(
         scripts = Scripts(script, pre, rollback, assume)
         timeout = min(max(float(timeout), 1.0), MAX_SCRIPT_TIMEOUT_S)
         options = Options(check, load, load_check, sample, bool(twice), timeout)
-        replay = Replay(_free_fork_name(workspace, replays), checkpoint, code_from)
+        await _close_old_replays(workspace, replays)
+        replay = Replay(_free_fork_name(workspace, replays, numbers), checkpoint, code_from)
         task = asyncio.create_task(replay_and_save(scripts, replay, options, goal))
         replays[replay.fork] = (task, replay)
         if background:
@@ -1136,9 +1139,20 @@ def _slow_hint(replay: Replay, options: Options) -> str:
     )
 
 
-def _free_fork_name(workspace: Workspace, taken: dict[str, object]) -> str:
-    """The first ``replay-N`` that is neither an open fork nor a replay being made."""
-    names = (f"{REPLAY_FORK}-{number}" for number in itertools.count(1))
+async def _close_old_replays(workspace: Workspace, running: dict[str, object]) -> None:
+    """Stop the forks of earlier replays (and their crash copies), except those still running: a
+    failed replay stays open to inspect until the next one, so they do not pile up in memory."""
+    for name, fork in list(workspace.forks.items()):
+        replay = name.split(CRASH_SUFFIX)[0]
+        if name.startswith(f"{REPLAY_FORK}-") and replay not in running:
+            del workspace.forks[name]
+            await workspace.backend.stop(fork.machine)
+
+
+def _free_fork_name(workspace: Workspace, taken: dict[str, object], numbers: Iterator[int]) -> str:
+    """The next ``replay-N`` (from ``numbers``, never reused in a session, so a closed replay's name
+    always means that replay) that is neither an open fork nor a replay being made."""
+    names = (f"{REPLAY_FORK}-{number}" for number in numbers)
     return next(name for name in names if name not in workspace.forks and name not in taken)
 
 
