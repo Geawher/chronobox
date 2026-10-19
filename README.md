@@ -192,8 +192,10 @@ claude mcp add chronobox -- chronobox mcp --project .
   `review` runs on your machine after each passed replay, with the user's goal, the scripts, the
   check and the report on its stdin. It answers `OK`, or `GAP` and up to two ways the change is
   likely to be wrong while the check passes, and the agent sees them. It only advises: the hand-off
-  is saved either way. Use a strong model: in our tests Haiku flagged almost every hand-off, good or
-  bad, while Sonnet flagged 74% of the hand-offs that later failed and 22% of those that worked.
+  is saved either way. Use a strong model: on 274 verified hand-offs, Haiku flagged almost every
+  one, good or bad, while Sonnet flagged 73% of those that later failed and 25% of those that
+  worked. It catches checks that miss the obvious, not subtle traps: on the hand-offs of the
+  hardest tasks it flagged failures and successes alike.
 
   `compare` catches a script that does not reproduce what the agent tested (a column it added
   by hand, a setting it forgot); the [example](examples/notes/chronobox.toml) compares the schema
