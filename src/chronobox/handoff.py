@@ -131,6 +131,8 @@ SAMPLE_CAVEAT = "the logic was checked, not the time or locks at full size"
 # A failed replay whose script ran this long gets a hint to check the logic on a sample first.
 SLOW_REPLAY_S = 120.0
 # A reviewer (``[handoff] review``) gets this long to answer; its first line is OK when it sees no gap.
+# The prompt asks for likely gaps only: in an offline test on 274 verified hand-offs (RESEARCH_LOG
+# E39), asking for any gap made every reviewer flag nearly every hand-off, which told agents nothing.
 REVIEW_TIMEOUT_S = 300.0
 REVIEW_OK = "OK"
 REVIEW_PROMPT = """You review a change script before it runs on a production machine. \
@@ -152,17 +154,16 @@ Traffic check after it: {load_check}
 The replay's report:
 {report}
 
-Look for what the check does not test, in particular:
-- writes by users while the script runs (lost, blocked, or missed by a backfill);
-- rows or requests that arrive after the script (do they get the new behaviour?);
-- data the script's logic gets wrong: records that look alike but are not the same, nulls, \
-  other owners, values production has and the copy may not;
-- effects that come later: scheduled jobs, compaction, caches, the next restart;
-- production being bigger or different from the copy.
+Judge it like a careful senior engineer who must decide whether to run this on production now. \
+Report a gap only if you think it is more likely than not that, on production, the change does not \
+do what the user asked or harms users while this check passes. A risk the replay already rules \
+out, or one that is merely possible, is not a gap. Consider in particular: writes by users while \
+the script runs; rows that arrive after it; data the logic gets wrong (records that look alike but \
+are not the same, nulls, other owners); effects that come later (scheduled jobs, compaction, \
+caches); production being bigger than the copy.
 
-Answer in plain text. If the check covers what the user asked, the first line is exactly OK. \
-Otherwise list at most 3 gaps, most likely first, each as: the gap in one sentence, then a shell \
-command the check could add to catch it."""
+The first line of your answer is exactly OK or exactly GAP. After GAP, give at most 2 gaps, most \
+likely first, each in one sentence with a shell command the check could add to catch it."""
 # verify_script waits this long for a replay, then leaves it running in the background.
 FOREGROUND_WAIT_S = 300.0
 # Each line: port, pid, working folder and command line of a process listening on TCP. Only bash,
