@@ -24,6 +24,7 @@ A project commits one file next to its code::
     env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 
     [handoff]                           # what `verify_script` adds to every replay
+    enabled = true                      # false: no `verify_script`, agents only change the machine
     prepare = ["bin/more-data"]         # make the replay fork look like production first
     load = "bin/traffic"                # runs during the replay, like real users
     load_check = "bin/traffic --report" # after it: fails if users saw errors or lost writes
@@ -61,7 +62,9 @@ COMMON_EXCLUDES = (
 TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service", "handoff"})
 MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
 PROJECT_KEYS = frozenset({"path", "target", "exclude"})
-HANDOFF_KEYS = frozenset({"prepare", "load", "load_check", "checks", "compare", "sample", "review"})
+HANDOFF_KEYS = frozenset(
+    {"enabled", "prepare", "load", "load_check", "checks", "compare", "sample", "review"}
+)
 IMAGE_KEYS = frozenset({"name", "reference", "dockerfile", "context"})
 SERVICE_KEYS = frozenset(
     {"name", "start", "ready", "env", "workdir", "restart", "ready_timeout", "after_setup"}
@@ -159,6 +162,8 @@ class HandoffSettings:
     the agent's own check.
 
     Attributes:
+        enabled: Whether agents get ``verify_script`` at all; ``False`` for a project whose
+            changes are only ever made on the machine itself, never handed over as scripts.
         prepare: Commands run on the replay fork before anything else, e.g. to load more or odder
             data, so it looks more like production than the agent's copy.
         load: A command started in the background before the script and stopped after the checks:
@@ -175,6 +180,7 @@ class HandoffSettings:
             or the gaps it sees in the check, which the agent is shown.
     """
 
+    enabled: bool = True
     prepare: tuple[str, ...] = ()
     load: str = ""
     load_check: str = ""
@@ -349,12 +355,16 @@ def _handoff(table: dict[str, Any]) -> HandoffSettings:
     """Read the ``[handoff]`` table.
 
     Raises:
-        ConfigError: If a command list is not a list of strings, or a command not a string.
+        ConfigError: If a command list is not a list of strings, a command not a string, or
+            ``enabled`` not a boolean.
     """
     for key in ("load", "load_check", "review"):
         if not isinstance(table.get(key, ""), str):
             raise ConfigError(f"handoff.{key} must be a string")
+    if not isinstance(table.get("enabled", True), bool):
+        raise ConfigError("handoff.enabled must be true or false")
     return HandoffSettings(
+        enabled=table.get("enabled", True),
         prepare=tuple(_list(table, "prepare", str)),
         load=table.get("load", ""),
         load_check=table.get("load_check", ""),

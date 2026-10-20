@@ -44,8 +44,18 @@ through the `chronobox` MCP tools.
   the damage. Then rehearse the real fix.
 - `checkpoint` and `rollback` restore main exactly, but a rollback also loses what users wrote
   since the checkpoint: on a machine that takes writes, prefer fixing forward.
+"""
+# Only for projects with hand-offs (`[handoff] enabled`, the default).
+HANDOFF_GUIDE = """
+### Change the machine, or hand over a script?
+The user's request decides, not the tools you have:
+- Asked to make a change (on this machine, the server, production): make it on main, rehearsing
+  what you are unsure of on a fork first. Do not hand over a script.
+- Asked for a script, a migration or a deploy step to run on a machine of theirs: prepare it here
+  and hand it over with `verify_script` (below); main is then only your copy.
+- If you cannot tell which they want, ask; if nobody can answer, change the machine.
 
-### Handing a change over (when you have `verify_script`)
+### Handing a change over (when asked for a script)
 - A change that needs more than file edits (a migration, a backfill, a restart, a setting outside
   the project) is handed over as a script plus the patch. The user runs `./apply.sh` on the real
   machine right after applying the patch: its `#!` line picks the shell (`/bin/sh` without one).
@@ -99,9 +109,12 @@ class GuideResult:
 
 
 def guide_section(config: ProjectConfig) -> str:
-    """The guide for this project, between its markers."""
+    """The guide for this project, between its markers; hand-offs only when the project has them."""
     services = ", ".join(service.name for service in config.services) or "none yet"
-    return f"{START_MARKER}\n{GUIDE.format(target=config.target, services=services)}{END_MARKER}\n"
+    guide = GUIDE.format(target=config.target, services=services)
+    if config.handoff.enabled:
+        guide += HANDOFF_GUIDE
+    return f"{START_MARKER}\n{guide}{END_MARKER}\n"
 
 
 def write_guide(config: ProjectConfig) -> GuideResult:
