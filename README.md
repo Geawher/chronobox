@@ -180,6 +180,7 @@ claude mcp add chronobox -- chronobox mcp --project .
 
   ```toml
   [handoff]
+  enabled = true                        # false: no verify_script, agents only change the machine
   prepare = ["bin/more-data"]           # make the replay look more like production first
   load = "bin/traffic"                  # users' traffic, running during the replay
   load_check = "bin/traffic --report"   # after it: fails if users lost writes
@@ -196,6 +197,12 @@ claude mcp add chronobox -- chronobox mcp --project .
   one, good or bad, while Sonnet flagged 73% of those that later failed and 25% of those that
   worked. It catches checks that miss the obvious, not subtle traps: on the hand-offs of the
   hardest tasks it flagged failures and successes alike.
+
+  Agents are told the user's request decides how they deliver: asked to make a change, they make
+  it on the machine (rehearsing on a fork); asked for a script, they hand it over with
+  `verify_script`; unsure, they ask. A project that never hands changes over sets
+  `enabled = false` (or the server runs with `--no-handoff`): no `verify_script`, and no hand-off
+  text in the agent's instructions or the guide.
 
   `compare` catches a script that does not reproduce what the agent tested (a column it added
   by hand, a setting it forgot); the [example](examples/notes/chronobox.toml) compares the schema
@@ -218,7 +225,7 @@ While `chronobox up` runs, `chronobox mcp --project .` (so every agent session) 
 machine instead of starting its own, and keeps it when the session ends.
 
 Options: `--project DIR`, `--no-warm`, `--image NAME` (default `default`),
-`--profile alone|rollback|chronobox` (default `chronobox`), `--guard`,
+`--profile alone|rollback|chronobox` (default `chronobox`), `--guard`, `--no-handoff`,
 `--setup script.sh` (prepare the machine at boot: install, start services, load
 data), `--mem`, `--disk`.
 

@@ -11,7 +11,7 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from chronobox.handoff import handoff_tools
-from chronobox.server import build_server
+from chronobox.server import _handoff, _note, build_server, parse_args
 from chronobox.service import WorkspaceService, request
 from chronobox.workspace import Profile
 
@@ -56,6 +56,36 @@ async def test_profiles_expose_only_their_tools() -> None:
     assert "verify_script" in (with_handoff.instructions or "")
     alone = build_server(Profile.ALONE, call, handoff=True)
     assert {tool.name for tool in await alone.list_tools()} == expected[Profile.ALONE]
+
+
+@pytest.mark.parametrize(
+    ("config", "flags", "offered"),
+    [
+        ("", [], True),
+        ("[handoff]\nenabled = false\n", [], False),
+        ("", ["--no-handoff"], False),
+        ("", ["--profile", "rollback"], False),
+    ],
+)
+def test_a_project_offers_hand_offs_unless_it_or_the_server_opts_out(
+    tmp_path: Path, config: str, flags: list[str], offered: bool
+) -> None:
+    """``verify_script`` and the hand-off text come with a project's chronobox profile, unless its
+    ``[handoff]`` says ``enabled = false`` or the server runs with ``--no-handoff``; the note then
+    says nothing of hand-offs. With them, it says when to hand over and when to change the machine."""
+    (tmp_path / "chronobox.toml").write_text('[[service]]\nname = "db"\nstart = "postgres"\n' + config)
+    args = parse_args(["--project", str(tmp_path), *flags])
+    note = _note(args) or ""
+    assert _handoff(args) is offered
+    assert ("verify_script" in note) is offered
+    if offered:
+        assert "Asked to make a change" in note and "do not hand over a script" in note
+
+
+async def test_a_plain_machine_with_no_handoff_has_no_verify_script() -> None:
+    """``--no-handoff`` wins over ``--handoff`` on a machine without a project."""
+    assert not _handoff(parse_args(["--connect", "m.sock", "--handoff", "--no-handoff"]))
+    assert _handoff(parse_args(["--connect", "m.sock", "--handoff"]))
 
 
 async def test_verify_script_forwards_every_argument_in_order(tmp_path: Path) -> None:

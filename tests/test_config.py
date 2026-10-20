@@ -87,7 +87,8 @@ compare = ["pg_dump -s"]
 review = "claude -p"
 """
     handoff = load_config(write(tmp_path, text)).handoff
-    assert handoff.review == "claude -p"
+    assert handoff.enabled and handoff.review == "claude -p"
+    assert not load_config(write(tmp_path, "[handoff]\nenabled = false\n")).handoff.enabled
     assert handoff.prepare == ("bin/more-data",) and handoff.checks == ("bin/smoke", "bin/api-test")
     assert (handoff.load, handoff.load_check, handoff.compare) == (
         "bin/traffic",
@@ -116,6 +117,7 @@ review = "claude -p"
         ("[handoff]\nchecks = 'make test'\n", "checks must be a list of str"),
         ("[handoff]\nload = ['a']\n", "handoff.load must be a string"),
         ("[handoff]\nreview = ['claude']\n", "handoff.review must be a string"),
+        ("[handoff]\nenabled = 'no'\n", "handoff.enabled must be true or false"),
         ("[handoff]\nsmoke = 'x'\n", "unknown keys in handoff: smoke"),
     ],
 )
