@@ -142,6 +142,9 @@ claude mcp add chronobox -- chronobox mcp --project .
   (`~/.cache/chronobox/warm`); later sessions restore it in about 0.1 s, as long as the
   config, the project's files and the image are unchanged (`--no-warm` to boot fresh). The
   saved machine is also the session's `start` checkpoint.
+  A project keeps one warm start (a new one replaces the old); `chronobox clean` deletes those of
+  projects that are gone (moved, deleted, a removed worktree) or unused for 30 days
+  (`--unused-days N`, `--all`, `--dry-run` to list them with their size first).
 - Two more tools: `diff(where)` (what changed in the project on main or a fork since it was
   copied in, as a patch for your local copy: `git apply` takes it, and your own edits since
   then stay out of it) and `export(path, where)` (copy files out to `.chronobox/exports/`).

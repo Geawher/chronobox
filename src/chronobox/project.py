@@ -28,6 +28,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from chronobox.config import ProjectConfig, Service
@@ -45,7 +46,8 @@ READY_POLL_S = 0.5
 READY_CHECK_TIMEOUT_S = 10.0
 RESTART_DELAY_S = 1
 LOG_TAIL_LINES = 30
-WARM_COMPLETE = "complete"
+WARM_COMPLETE = "complete"  # its modification time is the warm start's last use
+WARM_PROJECT = "project.txt"  # in a project's warm folder: the chronobox.toml it belongs to
 PARTIAL_SUFFIX = ".partial"
 STALE_PARTIAL_S = 3600  # a half-written warm snapshot this old was left by a crash
 # Bump when what a prepared machine holds changes (e.g. how services are started), so warm
@@ -241,6 +243,7 @@ class ProjectBoot:
             await self.backend.release(snapshot)
             shutil.rmtree(warm, ignore_errors=True)
             return None
+        _touch(warm / WARM_COMPLETE)
         self.was_warm = True
         self.baseline = warm / BASELINE
         return Booted(machine, snapshot)
@@ -301,6 +304,7 @@ class ProjectBoot:
             await self.backend.save(machine, partial)
             shutil.copyfile(self.baseline, partial / BASELINE)
             (partial / WARM_COMPLETE).touch()
+            (warm.parent / WARM_PROJECT).write_text(f"{self.config.file}\n")
             partial.rename(warm)
         except (OSError, VMError) as error:
             # Includes another session having saved the same key first: theirs is as good.
@@ -309,13 +313,15 @@ class ProjectBoot:
                 log.warning("could not save the warm start %s: %s", warm, error)
             return
         _prune_warm(warm)
+        # Saving is when the cache grows: also drop the warm starts of projects that are gone.
+        clean_warm_starts(warm.parent.parent, unused_for_s=None)
 
 
 def _prune_warm(keep: Path) -> None:
     """Delete the project's other warm snapshots, except those a session still uses and
     partial ones another session may still be writing."""
     for entry in keep.parent.iterdir():
-        if entry == keep:
+        if entry == keep or not entry.is_dir():
             continue
         try:
             _prune_one(entry)
@@ -334,6 +340,96 @@ def _prune_one(entry: Path) -> None:
         return
     with lock:
         shutil.rmtree(entry, ignore_errors=True)
+
+
+@dataclass(frozen=True)
+class WarmStart:
+    """One saved warm start in the cache.
+
+    Attributes:
+        folder: Its snapshot folder, ``<warm dir>/<project id>/<warm key>``.
+        project: The ``chronobox.toml`` it was made from; ``None`` if not recorded (older caches).
+        size_bytes: Disk space it takes (the memory file and disks are sparse: blocks in use).
+        last_used: When a session last started from it (or it was saved), as a Unix time.
+    """
+
+    folder: Path
+    project: Path | None
+    size_bytes: int
+    last_used: float
+
+    @property
+    def project_gone(self) -> bool:
+        """Its project's ``chronobox.toml`` no longer exists (moved, deleted, a removed worktree)."""
+        return self.project is not None and not self.project.exists()
+
+
+def list_warm_starts(warm_dir: Path) -> list[WarmStart]:
+    """Every complete warm start under ``warm_dir``, most recently used first."""
+    starts = []
+    for folder in sorted(warm_dir.glob(f"*/*/{WARM_COMPLETE}")):
+        folder = folder.parent
+        recorded = folder.parent / WARM_PROJECT
+        try:
+            project = Path(recorded.read_text().strip()) if recorded.is_file() else None
+            last_used = (folder / WARM_COMPLETE).stat().st_mtime
+            size = sum(path.stat().st_blocks * 512 for path in folder.rglob("*") if path.is_file())
+        except OSError:  # deleted meanwhile by another session's pruning
+            continue
+        starts.append(WarmStart(folder, project, size, last_used))
+    return sorted(starts, key=lambda start: start.last_used, reverse=True)
+
+
+def clean_warm_starts(
+    warm_dir: Path, *, unused_for_s: float | None, everything: bool = False, dry_run: bool = False
+) -> list[WarmStart]:
+    """Delete the warm starts of projects that are gone, and those unused for ``unused_for_s``.
+
+    A warm start a running session still uses is never deleted, whatever the options; a project's
+    folder is removed with its last warm start.
+
+    Args:
+        warm_dir: The warm-start cache (``default_warm_dir()``).
+        unused_for_s: Also delete warm starts not used for this many seconds; ``None``: only those
+            of projects that are gone.
+        everything: Delete every warm start not in use.
+        dry_run: Only say what would be deleted.
+
+    Returns:
+        The warm starts deleted (or that would be, with ``dry_run``).
+    """
+    now = time.time()
+    deleted = []
+    for start in list_warm_starts(warm_dir):
+        stale = unused_for_s is not None and now - start.last_used > unused_for_s
+        if not (everything or start.project_gone or stale):
+            continue
+        if dry_run:
+            deleted.append(start)
+            continue
+        lock = try_lock_saved(start.folder)
+        if lock is None:
+            continue
+        with lock:
+            shutil.rmtree(start.folder, ignore_errors=True)
+        deleted.append(start)
+        _remove_if_empty(start.folder.parent)
+    return deleted
+
+
+def _remove_if_empty(project_folder: Path) -> None:
+    """Remove a project's warm folder once no warm start (complete or partial) is left in it."""
+    if any(entry.is_dir() for entry in project_folder.iterdir()):
+        return
+    shutil.rmtree(project_folder, ignore_errors=True)
+
+
+def _touch(path: Path) -> None:
+    """Record a use; a cache that cannot be written only loses the date."""
+    try:
+        os.utime(path)
+    except OSError as error:
+        log.warning("could not record the use of %s: %s", path, error)
 
 
 async def project_diff(machine: Machine, config: ProjectConfig, baseline: bytes) -> str:
