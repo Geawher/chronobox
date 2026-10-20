@@ -57,11 +57,15 @@ through the `chronobox` MCP tools.
   here.
 - Your `check` decides whether you are done: make it fail unless the change works the way the user
   asked, used as users would (call the new endpoint, insert a new row and read it back), not only
-  that the services are up.
+  that the services are up. First ask what would make the change wrong on the real machine, and
+  make the check fail then: writes while the script runs; rows that arrive after it; data the
+  logic gets wrong (records that look alike but are not the same, nulls, other owners); effects
+  that come later (scheduled jobs, compaction, caches); more data than on your copy. Pass the
+  user's request as `goal`.
 - The check runs after the script and cannot see what users went through during it. When the
-  change could lose or block writes (restarts, failovers, migrations under traffic), pass `load`
-  (writes like the users', each logged when acknowledged) and `load_check` (fails if an
-  acknowledged write is missing).
+  change could lose or block writes (restarts, failovers, migrations under traffic), pass
+  `load_check` (fails if an acknowledged write is missing), and `load` (writes like the users',
+  each logged when acknowledged) unless the machine's own clients already write and log.
 - `assume` holds what the script relies on (table sizes, versions, which node leads): the user runs
   it first and stops if it fails, so a production that differs from your copy is caught before
   anything changes.
@@ -69,9 +73,10 @@ through the `chronobox` MCP tools.
   saw in this session, batches instead of one long locking statement, skip what is already done
   (a retry must finish the job, also after a crash halfway), and wait for what you restart to
   answer before moving on.
-- Mind the time: a replay takes as long as the script, plus the retries, and the call waits for
-  it. Know roughly how long the script takes before replaying it in full. For a long operation,
-  pass `sample` (commands that shrink the data) to check the logic in minutes, or
+- Mind the time: a replay takes as long as the script, plus the retries; the call waits up to 5
+  minutes, then the replay goes on in the background (collect it with `verify_result`). Know
+  roughly how long the script takes before replaying it in full. For a long operation, pass
+  `sample` (commands that shrink the data) to check the logic in minutes, or
   `background=true` and collect the result later with `verify_result`. If users are failing now,
   take the safe step on main first and hand the full change over after.
 """

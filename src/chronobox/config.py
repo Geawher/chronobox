@@ -61,7 +61,7 @@ COMMON_EXCLUDES = (
 TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service", "handoff"})
 MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
 PROJECT_KEYS = frozenset({"path", "target", "exclude"})
-HANDOFF_KEYS = frozenset({"prepare", "load", "load_check", "checks", "compare", "sample"})
+HANDOFF_KEYS = frozenset({"prepare", "load", "load_check", "checks", "compare", "sample", "review"})
 IMAGE_KEYS = frozenset({"name", "reference", "dockerfile", "context"})
 SERVICE_KEYS = frozenset(
     {"name", "start", "ready", "env", "workdir", "restart", "ready_timeout", "after_setup"}
@@ -170,6 +170,9 @@ class HandoffSettings:
             the replay, e.g. a schema dump: the script must reproduce what the agent tested.
         sample: Commands that shrink the replay's data, on every replay (the agent can also pass
             its own): the logic is checked in minutes, and the report says it ran on a sample.
+        review: A command on the host that reviews each passed hand-off, e.g. ``claude -p``: it
+            gets the user's goal, the scripts, the check and the report on stdin, and answers ``OK``
+            or the gaps it sees in the check, which the agent is shown.
     """
 
     prepare: tuple[str, ...] = ()
@@ -178,6 +181,7 @@ class HandoffSettings:
     checks: tuple[str, ...] = ()
     compare: tuple[str, ...] = ()
     sample: tuple[str, ...] = ()
+    review: str = ""
 
 
 @dataclass(frozen=True)
@@ -345,13 +349,11 @@ def _handoff(table: dict[str, Any]) -> HandoffSettings:
     """Read the ``[handoff]`` table.
 
     Raises:
-        ConfigError: If a command list is not a list of strings, or ``load_check`` comes without ``load``.
+        ConfigError: If a command list is not a list of strings, or a command not a string.
     """
-    for key in ("load", "load_check"):
+    for key in ("load", "load_check", "review"):
         if not isinstance(table.get(key, ""), str):
             raise ConfigError(f"handoff.{key} must be a string")
-    if table.get("load_check") and not table.get("load"):
-        raise ConfigError("handoff.load_check needs handoff.load")
     return HandoffSettings(
         prepare=tuple(_list(table, "prepare", str)),
         load=table.get("load", ""),
@@ -359,6 +361,7 @@ def _handoff(table: dict[str, Any]) -> HandoffSettings:
         checks=tuple(_list(table, "checks", str)),
         compare=tuple(_list(table, "compare", str)),
         sample=tuple(_list(table, "sample", str)),
+        review=table.get("review", ""),
     )
 
 
