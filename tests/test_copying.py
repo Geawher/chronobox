@@ -77,6 +77,8 @@ def test_init_writes_a_starter_config_once(tmp_path: Path, capsys: pytest.Captur
     one: a project's own config is not replaced by a template."""
     main(["init", "--project", str(tmp_path)])
     assert (tmp_path / "chronobox.toml").read_text().startswith("# How to bring this project up")
-    assert "chronobox mcp --project ." in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "chronobox mcp --project ." in printed and "AGENTS.md" in printed
+    assert "## Working with chronobox" in (tmp_path / "AGENTS.md").read_text()
     with pytest.raises(SystemExit, match="already exists"):
         main(["init", "--project", str(tmp_path)])

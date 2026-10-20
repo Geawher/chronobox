@@ -167,7 +167,7 @@ async def test_the_mcp_server_serves_a_project_with_diff_and_export(
         initialized = await session.initialize()
         assert "/src" in (initialized.instructions or "")
         tools = {tool.name for tool in (await session.list_tools()).tools}
-        assert {"diff", "export", "sync"} <= tools
+        assert {"diff", "export", "sync", "verify_script"} <= tools
         result = await session.call_tool("diff", {})
         assert "no changes" in text_of(result)
 

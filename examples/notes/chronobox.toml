@@ -24,3 +24,13 @@ workdir = "/"
 name = "app"
 start = "python3 app.py"
 ready = "curl -sf http://127.0.0.1:8000/health"
+
+# What `verify_script` adds to every replay of a hand-off.
+[handoff]
+load = "python3 traffic.py"                 # users keep writing and reading during the replay
+load_check = "python3 traffic.py --report"  # no note they were told was saved may be lost
+compare = [                                 # what the agent tested must be what the script makes
+  # (each dump has its own random \restrict key)
+  "pg_dump --schema-only -h 127.0.0.1 -U postgres postgres | grep -vE '^.(un)?restrict '",
+  "curl -s 127.0.0.1:8000/notes | python3 -c 'import json, sys; print(sorted(json.load(sys.stdin)[0]))'",
+]
