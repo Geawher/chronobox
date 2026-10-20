@@ -34,6 +34,7 @@ from chronobox.config import ConfigError, ProjectConfig, load_config
 from chronobox.handoff import handoff_tools
 from chronobox.images import DEFAULT_IMAGE
 from chronobox.project import (
+    CHANGE_OR_HANDOFF,
     ProjectBoot,
     default_warm_dir,
     project_note,
@@ -79,10 +80,8 @@ INSTRUCTIONS = {
 }
 
 # For a machine without a project, when hand-offs are on (--handoff-dir / --handoff).
-HANDOFF_NOTE = (
-    "When the user needs the change as a script to run on their real machine, check it with "
-    "`verify_script`, which replays it on a fresh fork of the machine as it was before your work; "
-    "what it saved is the hand-off."
+HANDOFF_NOTE = CHANGE_OR_HANDOFF.replace(
+    "with the project's checks ", "of the machine as it was before your work "
 )
 
 Call = Callable[..., Awaitable[str]]
@@ -99,8 +98,8 @@ def build_server(
     """MCP tools for a profile; every tool forwards to ``call(method, *args)``.
 
     With ``project_note`` (a project from ``chronobox.toml``), the agent is also told about the
-    project and gets its ``diff``, ``export`` and ``sync`` tools (and ``verify_script`` with forks).
-    ``handoff`` offers ``verify_script`` on a machine without a project (with forks).
+    project and gets its ``diff``, ``export`` and ``sync`` tools. ``handoff`` offers ``verify_script``
+    (with forks); without a project, the instructions then also say when to use it.
     """
     instructions = INSTRUCTIONS[profile] + (f" {project_note}" if project_note else "")
     if handoff and not project_note and profile is Profile.CHRONOBOX:
@@ -200,9 +199,10 @@ def build_server(
     ) -> str:
         """Check a change script the way the user will run it on the real machine, and hand it over
         with the patch: what it saves in .chronobox/exports/handoff/ is what the user runs, as
-        ./apply.sh (its #! line picks the shell; /bin/sh without one). Use it when the change needs
-        actions and not only file edits: a migration or a backfill, restarting services, a setting
-        outside the project.
+        ./apply.sh (its #! line picks the shell; /bin/sh without one). Use it only when the user wants
+        the change as a script to run on a machine of theirs; when they asked you to change this
+        machine, change main instead. A hand-off is for changes that need actions and not only file
+        edits: a migration or a backfill, restarting services, a setting outside the project.
 
         The replay: a new fork of `checkpoint` (default: the machine before your work, like the real
         one); `sample` if given (commands that shrink the data); `assume` (checks of what the script
@@ -257,7 +257,7 @@ def build_server(
         tools += [fork, compare, changes, promote, discard]
     if project_note:
         tools += [diff, export, sync]
-    if (project_note or handoff) and profile is Profile.CHRONOBOX:
+    if handoff and profile is Profile.CHRONOBOX:
         tools += [verify_script, verify_result]
     for tool in tools:
         server.add_tool(tool, name=tool.__name__.removesuffix("_guarded"))
@@ -363,7 +363,7 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
     if project is None:
         workspace = Workspace(backend, machine_spec(args), profile=args.profile, guard=args.guard)
         service = WorkspaceService(workspace)
-        if args.handoff_dir and args.profile is Profile.CHRONOBOX:
+        if args.handoff_dir and _handoff(args):
             service.extra_methods.update(handoff_tools(workspace, None, exports=args.handoff_dir.resolve()))
     else:
         boot = ProjectBoot(backend, project, None if args.no_warm else default_warm_dir())
@@ -371,7 +371,7 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
         workspace = Workspace(backend, spec, profile=args.profile, guard=args.guard, boot=boot)
         service = WorkspaceService(workspace)
         service.extra_methods.update(project_tools(workspace, boot))
-        if args.profile is Profile.CHRONOBOX:
+        if _handoff(args):
             service.extra_methods.update(handoff_tools(workspace, boot))
     booting = asyncio.create_task(service.boot())
     try:
@@ -406,6 +406,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--handoff", action="store_true", help="with --connect: offer verify_script (the --serve side has it)"
     )
+    parser.add_argument(
+        "--no-handoff",
+        action="store_true",
+        help="no verify_script, even for a project (agents only change the machine)",
+    )
     parser.add_argument("--setup", type=Path, help="shell script run once in the VM after boot")
     parser.add_argument("--image", default=DEFAULT_IMAGE, help="the machine's image (see `chronobox images`)")
     parser.add_argument("--mem", type=int, default=1024, help="VM memory in MiB")
@@ -423,14 +428,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _handoff(args: argparse.Namespace) -> bool:
-    """Whether a machine without a project offers ``verify_script``."""
+    """Whether ``verify_script`` is offered: never with ``--no-handoff`` or outside the chronobox
+    profile; for a project unless its ``[handoff]`` says ``enabled = false``; without a project only
+    with ``--handoff`` or ``--handoff-dir``."""
+    if args.no_handoff or args.profile is not Profile.CHRONOBOX:
+        return False
+    project = load_project(args)
+    if project is not None:
+        return project.handoff.enabled
     return bool(args.handoff or args.handoff_dir)
 
 
 def _note(args: argparse.Namespace) -> str | None:
     """The project note for the agent's instructions, if serving a project."""
     project = load_project(args)
-    return project_note(project, with_handoff=args.profile is Profile.CHRONOBOX) if project else None
+    return project_note(project, with_handoff=_handoff(args)) if project else None
 
 
 def main(argv: list[str] | None = None) -> None:

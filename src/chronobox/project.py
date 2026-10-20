@@ -505,12 +505,19 @@ def project_note(config: ProjectConfig, *, with_handoff: bool = False) -> str:
     )
     if not with_handoff:
         return note
-    return (
-        f"{note} When a change needs actions beyond file edits (a migration, restarts, settings "
-        "outside the project), the user needs a script: check it with `verify_script`, which replays "
-        "it on a fresh fork with the project's checks and saves it with the patch; what it saved is "
-        "the hand-off."
-    )
+    return f"{note} {CHANGE_OR_HANDOFF}"
+
+
+# Which way to work is the user's request, not the tools: agents given `verify_script` used it even
+# when asked to change the machine itself (E40: 27 of 30 Sonnet runs).
+CHANGE_OR_HANDOFF = (
+    "The user's request decides how you deliver. Asked to make a change (on this machine, the "
+    "server, production): make it on main, rehearsing what you are unsure of on a fork first, and do "
+    "not hand over a script. Asked for a script, a migration or a deploy step to run on a machine of "
+    "theirs: check it with `verify_script`, which replays it on a fresh fork with the project's "
+    "checks and saves it with the patch; what it saved is the hand-off. If you cannot tell which "
+    "they want, ask; if nobody can answer, change the machine."
+)
 
 
 async def _start_services(machine: Machine, config: ProjectConfig, *, after_setup: bool) -> None:
