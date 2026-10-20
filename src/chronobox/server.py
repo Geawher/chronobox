@@ -83,7 +83,7 @@ def build_server(
     """MCP tools for a profile; every tool forwards to ``call(method, *args)``.
 
     With ``project_note`` (a project from ``chronobox.toml``), the agent is also told about the
-    project and gets its ``diff`` and ``export`` tools.
+    project and gets its ``diff``, ``export`` and ``sync`` tools.
     """
     instructions = INSTRUCTIONS[profile] + (f" {project_note}" if project_note else "")
     server = MCPServer("chronobox", instructions=instructions)
@@ -156,13 +156,20 @@ def build_server(
         .chronobox/exports/<where>/ folder (results, dumps, logs)."""
         return await call("export", path, where)
 
+    async def sync(where: str = MAIN) -> str:
+        """Copy your edits of the project's local files into the project folder on the main machine
+        or a fork, so you can run and test them there (the project's services and dependencies
+        run only in the machine). Only files you created, changed or deleted locally since the
+        session started are synced; everything else on the machine stays as it is."""
+        return await call("sync", where)
+
     tools: list[Call] = [run_guarded if guard else run, wait]
     if profile in (Profile.ROLLBACK, Profile.CHRONOBOX):
         tools += [checkpoint, list_checkpoints, rollback]
     if profile is Profile.CHRONOBOX:
         tools += [fork, compare, changes, promote, discard]
     if project_note:
-        tools += [diff, export]
+        tools += [diff, export, sync]
     for tool in tools:
         server.add_tool(tool, name=tool.__name__.removesuffix("_guarded"))
     return server
