@@ -39,6 +39,10 @@
 ### Removed
 - `vm/fetch.sh` and `vm/build_rootfs.sh`: use `chronobox setup`. ([#15])
 
+### Fixed
+- A session stopped by its MCP client (SIGTERM) no longer leaves its VM files behind: several GB
+  per session, in the folder the server started from before 0.2.0. ([#15])
+
 ## 0.1.0 (2026-10)
 
 First public release: undo and forks of live Linux machines for coding agents, as an MCP server
