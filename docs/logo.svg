@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-label="chronobox">
+  <!-- Snapshots on a timeline, a jump back to one, and a new branch from it. -->
+  <rect x="10" y="10" width="180" height="180" rx="40" fill="#172338"/>
+  <path d="M40 112 H160" stroke="#5b6b88" stroke-width="7" stroke-linecap="round"/>
+  <path d="M152 100 C152 58 104 54 100 92" fill="none" stroke="#f2a93b" stroke-width="7" stroke-linecap="round"/>
+  <path d="M90 86 L100 101 L109 86 Z" fill="#f2a93b"/>
+  <path d="M100 112 C100 142 122 150 150 150" fill="none" stroke="#e8edf5" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="52" cy="112" r="9" fill="#e8edf5"/>
+  <circle cx="100" cy="112" r="11" fill="#f2a93b"/>
+  <circle cx="152" cy="112" r="9" fill="#5b6b88"/>
+  <circle cx="152" cy="150" r="10" fill="#e8edf5"/>
+</svg>
