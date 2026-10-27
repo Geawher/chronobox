@@ -151,8 +151,12 @@ def execute(argv: list[str], env: dict[str, str], timeout: float, *, script: str
     # command keep the descriptor open, and we must not wait for them.
     with tempfile.TemporaryFile() as out:
         process = subprocess.Popen(
-            argv, env=env, stdout=out, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL if script is None else subprocess.PIPE, start_new_session=True,
+            argv,
+            env=env,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL if script is None else subprocess.PIPE,
+            start_new_session=True,
         )
         try:
             if script is not None:

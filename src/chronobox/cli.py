@@ -8,6 +8,7 @@
     chronobox init                                   # a starter chronobox.toml (and AGENTS.md guide) here
     chronobox guide                                  # write or refresh the chronobox guide in AGENTS.md
     chronobox warm                                   # boot the project here once, save its warm start
+    chronobox clean                                  # delete unused warm starts (--dry-run lists them)
     chronobox up                                     # keep the project's machine running
     chronobox cp ./fixtures main:/src/fixtures       # copy into it (or out: main:/src/app.py ./out)
     chronobox down                                   # stop it
@@ -25,6 +26,7 @@ import asyncio
 import fcntl
 import os
 import sys
+import time
 from pathlib import Path
 
 from chronobox import server
@@ -39,11 +41,22 @@ from chronobox.config import (
 from chronobox.copying import CopyError, check_direction, pack_local, parse_location, unpack_local
 from chronobox.guide import CLAUDE_FILE, CLAUDE_IMPORT, write_guide
 from chronobox.images import Image, ImageError, build_image, build_tools, list_images
-from chronobox.project import ProjectBoot, default_warm_dir, session_root, up_socket
+from chronobox.project import (
+    ProjectBoot,
+    WarmStart,
+    clean_warm_starts,
+    default_warm_dir,
+    list_warm_starts,
+    session_root,
+    up_socket,
+)
 from chronobox.service import Op, ServiceError, get_remote, is_serving, put_remote, request
 from chronobox.vm import FirecrackerBackend, VMError, default_vm_dir
 
 BYTES_PER_MIB = 1024 * 1024
+BYTES_PER_GIB = 1024 * BYTES_PER_MIB
+SECONDS_PER_DAY = 86400
+DEFAULT_UNUSED_DAYS = 30
 MAX_SOCKET_PATH = 107  # bytes in sockaddr_un.sun_path, without the final NUL
 
 
@@ -155,6 +168,34 @@ def warm(args: argparse.Namespace) -> None:
             f"{config.file}: booted, prepared and saved in {boot.seconds:.1f} s; "
             "agent sessions now start warm"
         )
+
+
+def clean(args: argparse.Namespace) -> None:
+    """``chronobox clean``: delete warm starts of projects that are gone or unused for a while.
+
+    Warm starts in use by a running session are kept. With ``--dry-run`` nothing is deleted:
+    every warm start is listed, marked with whether it would go.
+    """
+    warm_dir = default_warm_dir()
+    unused_for_s = args.unused_days * SECONDS_PER_DAY
+    going = clean_warm_starts(warm_dir, unused_for_s=unused_for_s, everything=args.all, dry_run=args.dry_run)
+    if args.dry_run:
+        doomed = {start.folder for start in going}
+        for start in list_warm_starts(warm_dir):
+            print(f"{'delete' if start.folder in doomed else 'keep  '}  {describe_warm_start(start)}")
+    freed = sum(start.size_bytes for start in going)
+    verb = "would free" if args.dry_run else "freed"
+    print(f"{len(going)} warm start(s), {verb} {freed / BYTES_PER_GIB:.1f} GiB ({warm_dir})")
+
+
+def describe_warm_start(start: WarmStart) -> str:
+    """One line: size, days since last use, and the project (or why it is gone)."""
+    days = (time.time() - start.last_used) / SECONDS_PER_DAY
+    if start.project is None:
+        project = "unknown project"
+    else:
+        project = f"{start.project} (gone)" if start.project_gone else str(start.project)
+    return f"{start.size_bytes / BYTES_PER_GIB:5.1f} GiB  used {days:4.0f} days ago  {project}"
 
 
 async def prepare_warm_start(config: ProjectConfig, vm_dir: Path) -> ProjectBoot:
@@ -269,6 +310,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     images_parser = commands.add_parser("images", help="list built images")
     images_parser.set_defaults(handler=show_images)
+
+    clean_parser = commands.add_parser("clean", help="delete warm starts of gone or unused projects")
+    clean_parser.add_argument(
+        "--unused-days", type=float, default=DEFAULT_UNUSED_DAYS, help="also delete those unused this long"
+    )
+    clean_parser.add_argument("--all", action="store_true", help="delete every warm start not in use")
+    clean_parser.add_argument("--dry-run", action="store_true", help="list them, delete nothing")
+    clean_parser.set_defaults(handler=clean)
 
     project_commands = {
         "init": ("write a starter chronobox.toml and the AGENTS.md guide", init),
