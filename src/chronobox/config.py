@@ -23,6 +23,15 @@ A project commits one file next to its code::
     ready = "pg_isready -h 127.0.0.1"
     env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 
+    [handoff]                           # what `verify_script` adds to every replay
+    enabled = true                      # false: no `verify_script`, agents only change the machine
+    prepare = ["bin/more-data"]         # make the replay fork look like production first
+    load = "bin/traffic"                # runs during the replay, like real users
+    load_check = "bin/traffic --report" # after it: fails if users saw errors or lost writes
+    checks = ["bin/smoke-test"]         # must pass after the script
+    compare = ["pg_dump -s -U postgres"] # same output on the agent's machine and the replay
+    sample = ["bin/keep-a-tenth"]       # optional: shrink the data, to check the logic fast
+
 Relative paths are relative to the file's folder. Machines have no network: anything to
 install belongs in the image.
 """
@@ -50,11 +59,16 @@ COMMON_EXCLUDES = (
     "node_modules", ".venv", "venv", "__pycache__", "target", "dist",
     ".pytest_cache", ".mypy_cache", ".ruff_cache",
 )  # fmt: skip
-TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service"})
+TOP_LEVEL_KEYS = frozenset({"image", "prepare", "setup", "machine", "project", "service", "handoff"})
 MACHINE_KEYS = frozenset({"mem_mib", "disk_mib", "vcpus", "command_timeout"})
 PROJECT_KEYS = frozenset({"path", "target", "exclude"})
+HANDOFF_KEYS = frozenset(
+    {"enabled", "prepare", "load", "load_check", "checks", "compare", "sample", "review"}
+)
 IMAGE_KEYS = frozenset({"name", "reference", "dockerfile", "context"})
-SERVICE_KEYS = frozenset({"name", "start", "ready", "env", "workdir", "restart", "ready_timeout"})
+SERVICE_KEYS = frozenset(
+    {"name", "start", "ready", "env", "workdir", "restart", "ready_timeout", "after_setup"}
+)
 # Service names become file names in commands, so keep them to what needs no quoting.
 SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -85,6 +99,12 @@ exclude = {exclude}  # not copied in (.git and .chronobox never are)
 # start = "docker-entrypoint.sh postgres"  # runs in the foreground; restarted if it exits
 # ready = "pg_isready -h 127.0.0.1"        # succeeds once the service answers
 # env = {{ POSTGRES_HOST_AUTH_METHOD = "trust" }}
+#
+# [[service]]
+# name = "app"
+# start = "python manage.py runserver 127.0.0.1:8000"
+# ready = "curl -sf 127.0.0.1:8000/"
+# after_setup = true                       # start once setup (e.g. migrations) is done
 """
 
 
@@ -111,7 +131,7 @@ class ImageSource:
 
 @dataclass(frozen=True)
 class Service:
-    """A long-running process of the project, started in the machine before ``setup``.
+    """A long-running process of the project, started in the machine before ``setup`` (or after it).
 
     Attributes:
         name: Used for its log, ``/var/log/chronobox/<name>.log``.
@@ -121,6 +141,8 @@ class Service:
         workdir: Where ``start`` runs; defaults to the project's target.
         restart: Start it again whenever it exits (like Docker's ``unless-stopped``).
         ready_timeout: Seconds to wait for ``ready`` before the boot fails.
+        after_setup: Start it once ``setup`` is done instead of before, e.g. an app server that
+            needs the migrations ``setup`` runs against a database service.
     """
 
     name: str
@@ -130,6 +152,42 @@ class Service:
     workdir: str = ""
     restart: bool = True
     ready_timeout: float = DEFAULT_READY_TIMEOUT_S
+    after_setup: bool = False
+
+
+@dataclass(frozen=True)
+class HandoffSettings:
+    """What the project adds to every ``verify_script`` replay (the ``[handoff]`` table), so a
+    hand-off is checked against what the project's owner knows about production, not only against
+    the agent's own check.
+
+    Attributes:
+        enabled: Whether agents get ``verify_script`` at all; ``False`` for a project whose
+            changes are only ever made on the machine itself, never handed over as scripts.
+        prepare: Commands run on the replay fork before anything else, e.g. to load more or odder
+            data, so it looks more like production than the agent's copy.
+        load: A command started in the background before the script and stopped after the checks:
+            traffic like the real users'.
+        load_check: Run once ``load`` is stopped; fails if the users had a problem (errors, lost
+            writes).
+        checks: Commands that must succeed after the script (and the agent's check).
+        compare: Commands whose output must be the same on the machine the agent worked on and on
+            the replay, e.g. a schema dump: the script must reproduce what the agent tested.
+        sample: Commands that shrink the replay's data, on every replay (the agent can also pass
+            its own): the logic is checked in minutes, and the report says it ran on a sample.
+        review: A command on the host that reviews each passed hand-off, e.g. ``claude -p``: it
+            gets the user's goal, the scripts, the check and the report on stdin, and answers ``OK``
+            or the gaps it sees in the check, which the agent is shown.
+    """
+
+    enabled: bool = True
+    prepare: tuple[str, ...] = ()
+    load: str = ""
+    load_check: str = ""
+    checks: tuple[str, ...] = ()
+    compare: tuple[str, ...] = ()
+    sample: tuple[str, ...] = ()
+    review: str = ""
 
 
 @dataclass(frozen=True)
@@ -149,6 +207,7 @@ class ProjectConfig:
         disk_mib: Writable disk.
         vcpus: Virtual CPUs.
         command_timeout: Default timeout of one command, in seconds.
+        handoff: What ``verify_script`` adds to every replay.
     """
 
     file: Path
@@ -163,6 +222,7 @@ class ProjectConfig:
     disk_mib: int = DEFAULT_DISK_MIB
     vcpus: int = 2
     command_timeout: float = 300.0
+    handoff: HandoffSettings = HandoffSettings()
 
 
 def find_config(project: Path) -> Path:
@@ -207,6 +267,7 @@ def load_config(project: Path) -> ProjectConfig:
         disk_mib=int(machine.get("disk_mib", DEFAULT_DISK_MIB)),
         vcpus=int(machine.get("vcpus", 2)),
         command_timeout=float(machine.get("command_timeout", 300.0)),
+        handoff=_handoff(_table(raw, "handoff", HANDOFF_KEYS)),
     )
 
 
@@ -286,6 +347,31 @@ def _service(entry: dict[str, Any]) -> Service:
         workdir=entry.get("workdir", ""),
         restart=bool(entry.get("restart", True)),
         ready_timeout=float(entry.get("ready_timeout", DEFAULT_READY_TIMEOUT_S)),
+        after_setup=bool(entry.get("after_setup", False)),
+    )
+
+
+def _handoff(table: dict[str, Any]) -> HandoffSettings:
+    """Read the ``[handoff]`` table.
+
+    Raises:
+        ConfigError: If a command list is not a list of strings, a command not a string, or
+            ``enabled`` not a boolean.
+    """
+    for key in ("load", "load_check", "review"):
+        if not isinstance(table.get(key, ""), str):
+            raise ConfigError(f"handoff.{key} must be a string")
+    if not isinstance(table.get("enabled", True), bool):
+        raise ConfigError("handoff.enabled must be true or false")
+    return HandoffSettings(
+        enabled=table.get("enabled", True),
+        prepare=tuple(_list(table, "prepare", str)),
+        load=table.get("load", ""),
+        load_check=table.get("load_check", ""),
+        checks=tuple(_list(table, "checks", str)),
+        compare=tuple(_list(table, "compare", str)),
+        sample=tuple(_list(table, "sample", str)),
+        review=table.get("review", ""),
     )
 
 

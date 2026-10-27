@@ -31,8 +31,10 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 from chronobox.config import ConfigError, ProjectConfig, load_config
+from chronobox.handoff import handoff_tools
 from chronobox.images import DEFAULT_IMAGE
 from chronobox.project import (
+    CHANGE_OR_HANDOFF,
     ProjectBoot,
     default_warm_dir,
     project_note,
@@ -58,34 +60,50 @@ INSTRUCTIONS = {
         "are lost), so roll back soon after a mistake, or fix forward instead."
     ),
     Profile.CHRONOBOX: (
-        "You work on a Linux machine through `run`. Whenever you are not sure what a change "
-        "will do (a config or tuning value, a migration, a cleanup, an upgrade, a restart), "
-        "first `fork` the whole machine (disk, memory, running processes, live traffic) into "
-        "an independent copy and make the change there (run/wait with where=<fork>). Let "
-        "time pass and check that it really works and that no data was lost or changed; "
-        "several forks can try different options side by side. Then make the verified "
-        "change on the main machine and `discard` the forks. `checkpoint` / `rollback` "
-        "restore the main machine exactly, and risky commands are checkpointed "
-        "automatically, but a rollback also undoes what the machine's users did since the "
-        "checkpoint (writes they were told had succeeded are lost): on a machine that takes "
-        "writes, prefer fixing forward with a change verified on a fork. Discarding a fork "
-        "returns a report of what it did; lessons you record are shown again whenever you "
-        "fork or roll back."
+        "You work on a Linux machine through `run`. Before a change whose effect you are not sure "
+        "of (a config or tuning value, a migration, a cleanup, an upgrade, a restart), `fork` the "
+        "whole machine (disk, memory, running processes, live traffic) into an independent copy and "
+        "make the change there (run/wait with where=<fork>). Let time pass and check that it really "
+        "works and that no data was lost or changed; several forks can try options side by side. "
+        "Then make the verified change on the main machine and `discard` the forks. A rehearsal "
+        "takes as long as the real thing: rehearse what you are unsure of, not what you know, and "
+        "for a long operation try it on a sample or try only its risky steps. If users are failing "
+        "now, or will be before a full rehearsal could end (an outage, a limit about to run out), "
+        "first take a small step on the main machine that you know is safe and that stops or delays "
+        "the damage, then rehearse the real fix. `checkpoint` / `rollback` restore the main machine "
+        "exactly, and risky commands are checkpointed automatically, but a rollback also undoes "
+        "what the machine's users did since the checkpoint (writes they were told had succeeded "
+        "are lost): on a machine that takes writes, prefer fixing forward with a change verified "
+        "on a fork. Discarding a fork returns a report of what it did; lessons you record are "
+        "shown again whenever you fork or roll back."
     ),
 }
+
+# For a machine without a project, when hand-offs are on (--handoff-dir / --handoff).
+HANDOFF_NOTE = CHANGE_OR_HANDOFF.replace(
+    "with the project's checks ", "of the machine as it was before your work "
+)
 
 Call = Callable[..., Awaitable[str]]
 
 
 def build_server(
-    profile: Profile, call: Call, *, guard: bool = False, project_note: str | None = None
+    profile: Profile,
+    call: Call,
+    *,
+    guard: bool = False,
+    project_note: str | None = None,
+    handoff: bool = False,
 ) -> MCPServer:
     """MCP tools for a profile; every tool forwards to ``call(method, *args)``.
 
     With ``project_note`` (a project from ``chronobox.toml``), the agent is also told about the
-    project and gets its ``diff`` and ``export`` tools.
+    project and gets its ``diff``, ``export`` and ``sync`` tools. ``handoff`` offers ``verify_script``
+    (with forks); without a project, the instructions then also say when to use it.
     """
     instructions = INSTRUCTIONS[profile] + (f" {project_note}" if project_note else "")
+    if handoff and not project_note and profile is Profile.CHRONOBOX:
+        instructions += f" {HANDOFF_NOTE}"
     server = MCPServer("chronobox", instructions=instructions)
 
     async def run(command: str, where: str = MAIN) -> str:
@@ -156,13 +174,91 @@ def build_server(
         .chronobox/exports/<where>/ folder (results, dumps, logs)."""
         return await call("export", path, where)
 
+    async def sync(where: str = MAIN) -> str:
+        """Copy your edits of the project's local files into the project folder on the main machine
+        or a fork, so you can run and test them there (the project's services and dependencies
+        run only in the machine). Only files you created, changed or deleted locally since the
+        session started are synced; everything else on the machine stays as it is."""
+        return await call("sync", where)
+
+    async def verify_script(
+        script: str,
+        check: str,
+        pre: str = "",
+        rollback: str = "",
+        assume: str = "",
+        load: str = "",
+        load_check: str = "",
+        sample: str = "",
+        twice: bool = True,
+        background: bool = False,
+        code_from: str = MAIN,
+        checkpoint: str = "start",
+        timeout: float = 900,
+        goal: str = "",
+    ) -> str:
+        """Check a change script the way the user will run it on the real machine, and hand it over
+        with the patch: what it saves in .chronobox/exports/handoff/ is what the user runs, as
+        ./apply.sh (its #! line picks the shell; /bin/sh without one). Use it only when the user wants
+        the change as a script to run on a machine of theirs; when they asked you to change this
+        machine, change main instead. A hand-off is for changes that need actions and not only file
+        edits: a migration or a backfill, restarting services, a setting outside the project.
+
+        The replay: a new fork of `checkpoint` (default: the machine before your work, like the real
+        one); `sample` if given (commands that shrink the data); `assume` (checks of what the script
+        relies on, e.g. sizes, versions, which node leads: the user runs it first and stops if it
+        fails); `load` (your traffic, next to the project's); `pre` (before the new files, with the old
+        code still running); the project files of `code_from` (a machine, or "local" for the files you
+        edited locally); the script. With twice=true (default) it is also run again once it ended,
+        and must then finish quickly, and on copies of the replay it is killed midway and run again:
+        deployments get retried, sometimes after a crash. Then `check`, the project's checks,
+        `load_check` once the traffic stopped, the services' readiness, and a comparison with the
+        machine you tested on. `rollback`, if given, must undo the change once the old files are back.
+
+        `check` is required and decides whether you are done: a command that fails unless the change
+        works the way the user asked, used as users would (call the new endpoint, insert a new row and
+        read it back). Before writing it, ask what would make the change wrong on the real machine
+        and make the check fail then: writes while the script runs; rows that arrive after it;
+        data the logic gets wrong (records that look alike but are not the same, nulls, other
+        owners); effects that come later (scheduled jobs, compaction, caches); more data than here.
+        It runs after the script, so it cannot see what users went through during it:
+        when the change could lose or block writes (restarts, failovers, migrations under traffic),
+        pass `load_check` (fails if an acknowledged write is missing or requests failed), and `load`
+        (writes like the users', each logged when acknowledged) unless the machine's own clients
+        already write and log: they keep running on the replay.
+
+        Time: a replay takes as long as the script, plus the retries; this call waits up to 5 minutes,
+        then leaves it running and tells you to collect it with `verify_result`.
+        Know roughly how long the script takes before replaying it in full (from main, or a sample).
+        For a long operation pass `sample` to check the logic in minutes (the report says it ran on a
+        sample), or background=true to keep working and collect the result with `verify_result`. If
+        users are failing now, take the safe step on main first and hand the full change over after.
+
+        Pass the scripts' text, not paths. Write them for the real machine, which has more data and
+        live users: no values you only saw in this session, no long locks, skip what is already done
+        so a retry is quick, and wait for what you restart to answer. On failure nothing is saved and
+        the hand-off saved before is withdrawn. `timeout` limits each run of a script, in seconds.
+        `goal` is what the user asked, in their words: a project reviewer, if set, checks your
+        check against it (then it is required)."""
+        return await call(
+            "verify_script", script, check, pre, rollback, assume, load, load_check, sample,
+            twice, background, code_from, checkpoint, timeout, goal,
+        )  # fmt: skip
+
+    async def verify_result(fork: str = "", wait: float = 0) -> str:
+        """Get the result of a `verify_script` started with background=true (by default the last
+        one): waits up to `wait` seconds (at most 600) for it, else says what the replay is doing."""
+        return await call("verify_result", fork, wait)
+
     tools: list[Call] = [run_guarded if guard else run, wait]
     if profile in (Profile.ROLLBACK, Profile.CHRONOBOX):
         tools += [checkpoint, list_checkpoints, rollback]
     if profile is Profile.CHRONOBOX:
         tools += [fork, compare, changes, promote, discard]
     if project_note:
-        tools += [diff, export]
+        tools += [diff, export, sync]
+    if handoff and profile is Profile.CHRONOBOX:
+        tools += [verify_script, verify_result]
     for tool in tools:
         server.add_tool(tool, name=tool.__name__.removesuffix("_guarded"))
     return server
@@ -192,7 +288,9 @@ def machine_spec(args: argparse.Namespace) -> MachineSpec:
 async def run_local(args: argparse.Namespace) -> None:
     """Own a machine and serve it to one agent over stdio MCP; the machine stops when the agent leaves."""
     async with _owned_service(args) as service:
-        server = build_server(args.profile, service.call, guard=args.guard, project_note=_note(args))
+        server = build_server(
+            args.profile, service.call, guard=args.guard, project_note=_note(args), handoff=_handoff(args)
+        )
         await server.run_stdio_async()
 
 
@@ -237,7 +335,9 @@ async def run_connected(args: argparse.Namespace) -> None:
         """Forward one tool call to the serving process."""
         return await call_remote(args.connect, method, *call_args)
 
-    server = build_server(args.profile, call, guard=args.guard, project_note=_note(args))
+    server = build_server(
+        args.profile, call, guard=args.guard, project_note=_note(args), handoff=_handoff(args)
+    )
     if not args.http:
         await server.run_stdio_async()
         return
@@ -263,12 +363,16 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
     if project is None:
         workspace = Workspace(backend, machine_spec(args), profile=args.profile, guard=args.guard)
         service = WorkspaceService(workspace)
+        if args.handoff_dir and _handoff(args):
+            service.extra_methods.update(handoff_tools(workspace, None, exports=args.handoff_dir.resolve()))
     else:
         boot = ProjectBoot(backend, project, None if args.no_warm else default_warm_dir())
         spec = project_machine_spec(project)
         workspace = Workspace(backend, spec, profile=args.profile, guard=args.guard, boot=boot)
         service = WorkspaceService(workspace)
         service.extra_methods.update(project_tools(workspace, boot))
+        if _handoff(args):
+            service.extra_methods.update(handoff_tools(workspace, boot))
     booting = asyncio.create_task(service.boot())
     try:
         yield service
@@ -294,6 +398,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--project", type=Path, help="a project folder with chronobox.toml (sets image, setup, size)"
     )
     parser.add_argument("--no-warm", action="store_true", help="with --project: always boot fresh")
+    parser.add_argument(
+        "--handoff-dir",
+        type=Path,
+        help="without --project: offer verify_script, saving hand-offs under this folder",
+    )
+    parser.add_argument(
+        "--handoff", action="store_true", help="with --connect: offer verify_script (the --serve side has it)"
+    )
+    parser.add_argument(
+        "--no-handoff",
+        action="store_true",
+        help="no verify_script, even for a project (agents only change the machine)",
+    )
     parser.add_argument("--setup", type=Path, help="shell script run once in the VM after boot")
     parser.add_argument("--image", default=DEFAULT_IMAGE, help="the machine's image (see `chronobox images`)")
     parser.add_argument("--mem", type=int, default=1024, help="VM memory in MiB")
@@ -303,15 +420,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.http and not args.connect:
         parser.error("--http needs --connect")
+    if args.handoff and not args.connect:
+        parser.error("--handoff goes with --connect (without it, use --handoff-dir or a project)")
+    if args.project and args.handoff_dir:
+        parser.error("--handoff-dir does not go with --project (hand-offs go to its .chronobox/exports)")
     if args.project and args.setup:
         parser.error("--setup does not go with --project (use prepare/setup in chronobox.toml)")
     return args
 
 
+def _handoff(args: argparse.Namespace) -> bool:
+    """Whether ``verify_script`` is offered: never with ``--no-handoff`` or outside the chronobox
+    profile; for a project unless its ``[handoff]`` says ``enabled = false``; without a project only
+    with ``--handoff`` or ``--handoff-dir``."""
+    if args.no_handoff or args.profile is not Profile.CHRONOBOX:
+        return False
+    project = load_project(args)
+    if project is not None:
+        return project.handoff.enabled
+    return bool(args.handoff or args.handoff_dir)
+
+
 def _note(args: argparse.Namespace) -> str | None:
     """The project note for the agent's instructions, if serving a project."""
     project = load_project(args)
-    return project_note(project) if project else None
+    return project_note(project, with_handoff=_handoff(args)) if project else None
 
 
 def main(argv: list[str] | None = None) -> None:

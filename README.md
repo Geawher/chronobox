@@ -30,23 +30,60 @@ There is no search or autopilot inside: the agent decides when to use the tools.
 
 ## Does it help?
 
-We measured it on [chronobox-ops](https://github.com/Geawher/chronobox-ops), our benchmark
-of 34 tasks on live production machines. Each task has a hazard a careful engineer
-avoids: traffic that must keep flowing, writes that must not be lost, a setting that only
-looks safe. Claude Code with chronobox, compared with the same Claude Code alone:
+We measured it on [chronobox-ops](https://github.com/Geawher/chronobox-ops), our benchmark of
+operations tasks on live production machines. Each task has a hazard a careful engineer avoids:
+traffic that must keep flowing, writes that must not be lost, a setting that only looks safe.
+Every run is Claude Code with its normal tools; "alone" is the same Claude Code reaching the same
+machine without chronobox's checkpoints, forks or hand-offs.
 
-- **A cheaper model matches a stronger one.** Sonnet 5.5 with chronobox does the task
-  on 86% of runs and harms users on 12%, against 82% and 13% for Opus 4.8 alone, at
-  $0.13 per run instead of $1.09. The 95% intervals of the differences, [−3, +13] and
-  [−7, +5] points, leave no gap we can measure.
-- **The same model is safer.** Sonnet 5.5 succeeds on 14 points more runs and harms users
-  half as often (72% → 86%; 26% → 12%), both outside chance. Sonnet 5 (+11 points) and
-  Opus 4.8 (+7) gain too.
-- **The strongest model does not need it.** Opus 5.5 succeeds on 96% of runs alone, often
-  by building its own test copy, and gains nothing.
+### Working on the live machine (34 tasks)
 
-The benchmark is ours, and its tasks are built around such hazards: on routine work with
-nothing to break, expect little difference. Full results, per-task tables and method:
+| Model | Runs per setup | Success: alone → chronobox | Harm: alone → chronobox | Cost per run | Median time |
+|---|---|---|---|---|---|
+| Haiku 4.5 | 102 | 29% → 37% | 55% → 43% | $0.15 → $0.19 | 2.2 → 3.4 min |
+| Sonnet 5 | 102 | 75% → **85%** | 24% → **12%** | $0.46 → $0.56 | 4.3 → 6.1 min |
+| Sonnet 5.5 | 204 | 72% → **86%** | 26% → **12%** | $0.11 → $0.13 | 1.6 → 1.9 min |
+| Opus 4.8 | 204 / 102 | 82% → **89%** | 13% → **7%** | $1.09 → $1.26 | 5.0 → 7.5 min |
+| Opus 5.5 | 102 | 96% → 96% | 3% → 4% | $0.30 → $0.34 | 3.2 → 4.5 min |
+
+- **A cheaper model matches a stronger one.** Sonnet 5.5 with chronobox (86% success, 12% harm)
+  does as well as Opus 4.8 alone (82%, 13%) at $0.13 per run instead of $1.09; the 95% intervals
+  of the differences, [−3, +13] and [−7, +5] points, leave no gap we can measure.
+- **The same model is safer.** Sonnet 5.5 succeeds on 14 points more runs and harms users half
+  as often, both outside chance. Alone, its failures are production harm: lost writes, downtime.
+  With forks it tries the risky step on a copy first and sees it break there.
+- **What it costs:** about 15-25% more per run, and 20-50% more time, for the rehearsals.
+
+### Handing over a script instead (10 tasks, preliminary)
+
+On the 10 tasks that suit a hand-off (migrations, rolling restarts, cleanups), the agent can also
+work on a copy and hand over a script, which `verify_script` replays under traffic, killed
+midway and run again, before saving it. We graded each script on a production that had drifted
+from the agent's copy (more rows, another leader), killed it halfway and ran it again:
+
+| Model | Alone, live | chronobox, live | chronobox hand-off |
+|---|---|---|---|
+| Sonnet 5.5 | 17/30, harm 13, $0.15 | 20/30, harm 9, $0.19 | **24/30, harm 5**, $0.22 |
+| Opus 4.8 | 18/30, harm 10, $1.64 | 22/30, harm 7, $1.89 | 18/30, harm 6, $2.12+ |
+| Opus 5.5 | 28/30, harm 2, $0.42 | 28/30, harm 2, $0.44 | **30/30, harm 0**, $1.12 |
+
+The hand-off was the safest way to work for every model, and Sonnet 5.5's hand-offs beat Opus
+4.8 working live. Three seeds per cell, and the live columns ran a week earlier on older Claude
+Code and chronobox versions: read these as directions, not final numbers.
+
+### Where it does not help
+
+- **The strongest model:** Opus 5.5 succeeds on 96% of live runs alone, often by building its own
+  test copy, and gains nothing there.
+- **The weakest:** Haiku 4.5 gains a little but still fails most hard tasks; a safe place to try
+  a wrong idea does not make it right.
+- **Slow, thorough models on a time limit:** 7 of Opus 4.8's 30 hand-offs ran out of the 30
+  minutes before handing anything over, most of them still rehearsing by hand on forks.
+- **Routine work:** on six simple changes to a small notes app (a column, a constraint, an
+  index...), every model succeeded on 28-30 of 30 runs with no harm, with or without chronobox.
+
+The benchmark is ours, and its tasks are built around hazards like these. Full results,
+per-task tables and method:
 [chronobox-ops results](https://github.com/Geawher/chronobox-ops/blob/main/results/README.md).
 
 ## Requirements
@@ -127,7 +164,7 @@ env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 
 ```bash
 cd path/to/app
-chronobox init                     # a starter chronobox.toml (never overwrites one)
+chronobox init                     # a starter chronobox.toml (never overwrites one) and AGENTS.md guide
 chronobox build --project .        # the image it declares, once
 chronobox warm                     # optional: prepare the warm start now, not in the first session
 claude mcp add chronobox -- chronobox mcp --project .
@@ -137,7 +174,9 @@ claude mcp add chronobox -- chronobox mcp --project .
 `uv run --project /path/to/chronobox chronobox`.)
 
 - The project is copied to `/src` (`[project] target`), where commands start.
-- Services run under a small restart loop, logs in `/var/log/chronobox/<name>.log`.
+- Services run under a small restart loop, logs in `/var/log/chronobox/<name>.log`. They start
+  before `setup`; one that needs it (an app server that needs the migrations `setup` runs)
+  says `after_setup = true`.
 - **Warm start**: the first session prepares the machine and saves it
   (`~/.cache/chronobox/warm`); later sessions restore it in about 0.1 s, as long as the
   config, the project's files and the image are unchanged (`--no-warm` to boot fresh). The
@@ -145,9 +184,73 @@ claude mcp add chronobox -- chronobox mcp --project .
   A project keeps one warm start (a new one replaces the old); `chronobox clean` deletes those of
   projects that are gone (moved, deleted, a removed worktree) or unused for 30 days
   (`--unused-days N`, `--all`, `--dry-run` to list them with their size first).
-- Two more tools: `diff(where)` (what changed in the project on main or a fork since it was
-  copied in, as a patch for your local copy: `git apply` takes it, and your own edits since
-  then stay out of it) and `export(path, where)` (copy files out to `.chronobox/exports/`).
+- Three more tools:
+  - `diff(where)`: what changed in the project on main or a fork since the machine was
+    ready, as a patch for your local copy (`git apply` takes it; your own edits since then,
+    and files the project's setup wrote, stay out of it);
+  - `export(path, where)`: copy files out to `.chronobox/exports/`;
+  - `sync(where)`: copy local edits of the project's files (new, changed, deleted since the
+    session started) into main or a fork, for an agent that edits files locally but needs the
+    machine to run them.
+- **Hand-off scripts**: some changes are actions, not file edits (a migration, a backfill,
+  restarting services, a setting outside the project). The agent writes them as a script and
+  calls `verify_script(script, check)`, which replays it the way you will run it (`./apply.sh`:
+  its `#!` line picks the shell, `/bin/sh` without one): on a new fork of the `start` checkpoint
+  (the machine before the agent's work), after deploying the project's changed files (from main,
+  a fork, or with `code_from="local"` the files edited locally). The replay passes only if:
+  - the script succeeds, and again when run a second time, quickly (a retry must not redo the
+    whole job), and when killed midway and run again, on copies of the replay snapshotted while
+    it ran (deployments get retried, sometimes after a crash);
+  - the agent's `check` passes (it is required), and the project's checks;
+  - the traffic during the replay (the project's, the agent's own `load`, or the machine's own
+    clients) lost nothing (`load_check`);
+  - every service still answers its `ready` command, and a project process the agent restarted
+    on its machine was restarted by the script too.
+
+  Optional scripts are replayed in their place and handed over: `assume` (what the change relies
+  on, run first: you stop if it fails), `pre` (before the new files, with the old code running)
+  and `rollback` (once the old files are back). `sample` shrinks the replay's data so a long
+  operation's logic is checked in minutes (the report says it ran on a sample), and
+  `background=true` returns at once, the result coming from `verify_result` (a replay still going
+  after 5 minutes goes on in the background the same way). Then the patch, the scripts and the
+  replay's report, which starts with what the replay showed, are saved in `.chronobox/exports/handoff/`, ready for the real
+  machine; a failed replay withdraws the hand-off saved before (to `handoff-withdrawn/`).
+- **`[handoff]`**: what you know about production, added to every replay so the agent's own check
+  is not the only one:
+
+  ```toml
+  [handoff]
+  enabled = true                        # false: no verify_script, agents only change the machine
+  prepare = ["bin/more-data"]           # make the replay look more like production first
+  load = "bin/traffic"                  # users' traffic, running during the replay
+  load_check = "bin/traffic --report"   # after it: fails if users lost writes
+  checks = ["bin/smoke-test"]           # must pass after the script
+  compare = ["pg_dump -s -U postgres"]  # same output on the agent's machine and on the replay
+  sample = ["bin/keep-a-tenth"]         # optional: every replay on a sample of the data
+  review = "claude -p --model claude-sonnet-5-5"  # optional: a second opinion on the agent's check
+  ```
+
+  `review` runs on your machine after each passed replay, with the user's goal, the scripts, the
+  check and the report on its stdin. It answers `OK`, or `GAP` and up to two ways the change is
+  likely to be wrong while the check passes, and the agent sees them. It only advises: the hand-off
+  is saved either way. Use a strong model: on 274 verified hand-offs, Haiku flagged almost every
+  one, good or bad, while Sonnet flagged 73% of those that later failed and 25% of those that
+  worked. It catches checks that miss the obvious, not subtle traps: on the hand-offs of the
+  hardest tasks it flagged failures and successes alike.
+
+  Agents are told the user's request decides how they deliver: asked to make a change, they make
+  it on the machine (rehearsing on a fork); asked for a script, they hand it over with
+  `verify_script`; unsure, they ask. A project that never hands changes over sets
+  `enabled = false` (or the server runs with `--no-handoff`): no `verify_script`, and no hand-off
+  text in the agent's instructions or the guide.
+
+  `compare` catches a script that does not reproduce what the agent tested (a column it added
+  by hand, a setting it forgot); the [example](examples/notes/chronobox.toml) compares the schema
+  and the API's fields, with [traffic.py](examples/notes/traffic.py) as its users.
+- **A guide for agents**: `chronobox init` (or `chronobox guide`, to refresh it) writes how to work
+  with the machine into the project's `AGENTS.md`, between marker lines, keeping the rest of the
+  file. Codex, Cursor and others read AGENTS.md; Claude Code reads it when the project has no
+  `CLAUDE.md` (otherwise add a line `@AGENTS.md` to CLAUDE.md, which `chronobox guide` reminds you).
 - Machines have no network: install everything in the image.
 
 To work on the same machine as the agent, keep it running yourself:
@@ -162,7 +265,7 @@ While `chronobox up` runs, `chronobox mcp --project .` (so every agent session) 
 machine instead of starting its own, and keeps it when the session ends.
 
 Options: `--project DIR`, `--no-warm`, `--image NAME` (default `default`),
-`--profile alone|rollback|chronobox` (default `chronobox`), `--guard`,
+`--profile alone|rollback|chronobox` (default `chronobox`), `--guard`, `--no-handoff`,
 `--setup script.sh` (prepare the machine at boot: install, start services, load
 data), `--mem`, `--disk`.
 
@@ -179,14 +282,17 @@ data), `--mem`, `--disk`.
 | `compare(command, forks)` | chronobox | the same command on main and forks, side by side |
 | `changes(name)` | chronobox | commands, failures and files a fork changed |
 | `promote(name)` / `discard(name, lesson)` | chronobox | keep a fork as main / drop it, with a report |
-| `diff(where)` / `export(path, where)` | chronobox, with `--project` | the project's changes as a patch / copy files out |
+| `diff(where)` / `export(path, where)` / `sync(where)` | all, with `--project` | the project's changes as a patch / copy files out / copy local edits in |
+| `verify_script(script, check, ...)` / `verify_result(fork, wait)` | chronobox, with `--project` or `--handoff` | replay a change script on a fresh fork (retries, kills, traffic, the project's checks), then save the hand-off / collect a replay run in the background |
 
 With `--profile chronobox`, risky commands (deletes, kills, restarts, SQL changes,
 overwrites) are checkpointed automatically first.
 
 The tool descriptions steer the agent to the safe pattern on a machine that serves
 users: fork, try the change and let time pass on the fork, then apply the verified
-change to the main machine. A rollback is exact, so it also undoes the writes users
+change to the main machine. They also say when not to: a rehearsal takes as long as the real
+thing, so when users are failing now the agent first takes a small step it knows is safe to stop
+the damage, and rehearses only what it is unsure of. A rollback is exact, so it also undoes the writes users
 made since the checkpoint; on a machine that takes writes, fixing forward is usually
 better.
 
@@ -227,9 +333,10 @@ lazily; checkpoints are files on disk.
 ```
 src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints, forks,
                  reports, lessons, guard) · commands.py · service.py · server.py (MCP)
-                 images.py · cli.py (`chronobox build`, `images`, `warm`, `up`, `cp`, `down`, `mcp`)
-                 config.py (chronobox.toml) · project.py (bring a project up, warm start, diff,
-                 export) · copying.py (`chronobox cp`)
+                 images.py · cli.py (`chronobox build`, `images`, `init`, `guide`, `warm`, `up`, `cp`,
+                 `down`, `mcp`) · config.py (chronobox.toml) · project.py (bring a project up, warm
+                 start, diff, export, sync) · handoff.py (`verify_script`) · guide.py (AGENTS.md)
+                 · copying.py (`chronobox cp`)
 vm/              tools/ (tools drive: init, guest agent) · images/default/ · fetch.sh · build_rootfs.sh
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
 examples/notes/  a web app + PostgreSQL project with its chronobox.toml

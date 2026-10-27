@@ -5,7 +5,8 @@
     chronobox build --dockerfile ./Dockerfile        # or one built from a Dockerfile
     chronobox build --project .                      # the image a chronobox.toml declares
     chronobox images                                 # what is built
-    chronobox init                                   # a starter chronobox.toml for the project here
+    chronobox init                                   # a starter chronobox.toml (and AGENTS.md guide) here
+    chronobox guide                                  # write or refresh the chronobox guide in AGENTS.md
     chronobox warm                                   # boot the project here once, save its warm start
     chronobox clean                                  # delete unused warm starts (--dry-run lists them)
     chronobox up                                     # keep the project's machine running
@@ -38,6 +39,7 @@ from chronobox.config import (
     starter_config,
 )
 from chronobox.copying import CopyError, check_direction, pack_local, parse_location, unpack_local
+from chronobox.guide import CLAUDE_FILE, CLAUDE_IMPORT, write_guide
 from chronobox.images import Image, ImageError, build_image, build_tools, list_images
 from chronobox.project import (
     ProjectBoot,
@@ -131,9 +133,28 @@ def init(args: argparse.Namespace) -> None:
         "chronobox warm               # optional: prepare the warm start now",
         "claude mcp add chronobox -- chronobox mcp --project .",
     ]
-    print(f"wrote {file}\nnext: add the project's services and setup, then:")
+    print(f"wrote {file}")
+    say_guide(load_config(folder))
+    print("next: add the project's services and setup, then:")
     for step in steps:
         print(f"  {step}")
+
+
+def guide(args: argparse.Namespace) -> None:
+    """``chronobox guide``: write the chronobox guide for agents into the project's AGENTS.md, or
+    refresh it (after the services change, or a chronobox upgrade)."""
+    say_guide(load_config(args.project))
+
+
+def say_guide(config: ProjectConfig) -> None:
+    """Write the guide, then say where, and how Claude Code reads it if the project has a CLAUDE.md."""
+    result = write_guide(config)
+    print(f"{'wrote' if result.created else 'updated'} the chronobox guide for agents in {result.file}")
+    if result.claude_hint:
+        print(
+            f"  Claude Code reads {CLAUDE_FILE} instead of AGENTS.md here: add a line `{CLAUDE_IMPORT}` "
+            f"to {CLAUDE_FILE} so it reads the guide too"
+        )
 
 
 def warm(args: argparse.Namespace) -> None:
@@ -299,7 +320,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     clean_parser.set_defaults(handler=clean)
 
     project_commands = {
-        "init": ("write a starter chronobox.toml", init),
+        "init": ("write a starter chronobox.toml and the AGENTS.md guide", init),
+        "guide": ("write or refresh the chronobox guide in AGENTS.md", guide),
         "warm": ("boot a project once and save its warm start", warm),
         "up": ("keep a project's machine running (Ctrl-C stops it)", up),
         "down": ("stop the machine `chronobox up` keeps", down),

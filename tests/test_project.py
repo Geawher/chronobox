@@ -24,6 +24,7 @@ from chronobox.project import (
     clean_warm_starts,
     is_excluded,
     list_warm_starts,
+    local_edits,
     pack_project,
     project_entries,
     service_command,
@@ -256,3 +257,20 @@ def test_a_patch_with_added_changed_and_deleted_files_applies_with_git(tmp_path:
     assert not (host / "old.py").exists()
     assert (host / "lib" / "util.py").read_text() == "a = 2\n"
     assert (host / "lib" / "new.py").read_text() == "new\n"
+
+
+def test_local_edits_are_new_changed_or_deleted_files_not_touched_ones(project: Path) -> None:
+    """Between two archives of the project, a touched file is not an edit, a changed, new or
+    deleted one is; the archive of edits carries the changed files with their folders."""
+    config = load_config(project)
+    copied = pack_project(config)
+    os.utime(project / "main.py")
+    (project / "src").mkdir(exist_ok=True)
+    (project / "src" / "new.py").write_text("new")
+    (project / "main.py").write_text("changed")
+    (project / "data" / "seed.sql").unlink()
+    archive, changed, deleted = local_edits(copied, pack_project(config))
+    assert (changed, deleted) == (["main.py", "src/new.py"], ["data/seed.sql"])
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        assert sorted(tar.getnames()) == ["main.py", "src", "src/new.py"]
+    assert local_edits(copied, copied)[1:] == ([], [])
