@@ -72,7 +72,7 @@ async def test_verify_script_forwards_every_argument_in_order(tmp_path: Path) ->
     await server.call_tool("verify_script", {"script": "s", "check": "c", "load": "l", "background": True})
     await server.call_tool("verify_result", {"wait": 5})
     assert calls == [
-        ("verify_script", "s", "c", "", "", "", "l", "", "", True, True, "main", "start", 900),
+        ("verify_script", "s", "c", "", "", "", "l", "", "", True, True, "main", "start", 900, ""),
         ("verify_result", "", 5),
     ]
     methods = handoff_tools(None, None, exports=tmp_path)  # type: ignore[arg-type]
