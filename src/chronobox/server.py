@@ -22,7 +22,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
 import secrets
+import shutil
+import signal
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -46,6 +49,10 @@ from chronobox.project import machine_spec as project_machine_spec
 from chronobox.service import WorkspaceService, call_remote, is_serving
 from chronobox.vm import FirecrackerBackend, MachineSpec, VMError
 from chronobox.workspace import MAIN, Profile, Workspace
+
+# MCP clients stop a server with one of these (after closing its stdin, or instead of it).
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+EXIT_ON_SIGNAL = 128
 
 INSTRUCTIONS = {
     Profile.ALONE: (
@@ -362,6 +369,9 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
     """
     project = load_project(args)
     backend = FirecrackerBackend(args.root)
+    loop = asyncio.get_running_loop()
+    for stop in STOP_SIGNALS:
+        loop.add_signal_handler(stop, _stop_now, backend, stop)
     if project is None:
         workspace = Workspace(backend, machine_spec(args), profile=args.profile, guard=args.guard)
         service = WorkspaceService(workspace)
@@ -379,9 +389,21 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
     try:
         yield service
     finally:
+        for stop in STOP_SIGNALS:
+            loop.remove_signal_handler(stop)
         booting.cancel()
         await workspace.close()
         await backend.cleanup()
+
+
+def _stop_now(backend: FirecrackerBackend, signum: int) -> None:
+    """Delete the session's VMs and checkpoints, then exit at once.
+
+    A stdio server waits on stdin in a thread, so a cancelled server would not stop until the client
+    killed it, leaving gigabytes of VM files behind. Firecracker processes die with this one.
+    """
+    shutil.rmtree(backend.root, ignore_errors=True)
+    os._exit(EXIT_ON_SIGNAL + signum)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

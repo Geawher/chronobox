@@ -58,7 +58,7 @@ from chronobox.vm import FirecrackerBackend, VMError, clean_sessions, default_vm
 BYTES_PER_MIB = 1024 * 1024
 GITIGNORE = ".gitignore"
 IGNORE_LINE = ".chronobox/"
-IGNORE_FORMS = {".chronobox", ".chronobox/", "/.chronobox", "/.chronobox/"}
+IGNORE_FORMS = {".chronobox", ".chronobox/", "/.chronobox", "/.chronobox/", ".chronobox/*", "/.chronobox/*"}
 BYTES_PER_GIB = 1024 * BYTES_PER_MIB
 SECONDS_PER_DAY = 86400
 DEFAULT_UNUSED_DAYS = 30
@@ -166,17 +166,17 @@ def init(args: argparse.Namespace) -> None:
 
 
 def ignore_state(folder: Path) -> bool:
-    """In a git repository, add ``.chronobox/`` to its ``.gitignore`` unless it is there already;
-    return whether it was added."""
-    if not (folder / ".git").exists():
+    """In a git repository (the folder or one of its parents), add ``.chronobox/`` to the folder's
+    ``.gitignore`` unless it is there already; return whether it was added."""
+    if not any((parent / ".git").exists() for parent in (folder, *folder.parents)):
         return False
     gitignore = folder / GITIGNORE
-    lines = gitignore.read_text().splitlines() if gitignore.exists() else []
-    if IGNORE_FORMS & {line.strip() for line in lines}:
+    # surrogateescape: any bytes a .gitignore holds are written back unchanged.
+    content = gitignore.read_text(errors="surrogateescape") if gitignore.exists() else ""
+    if IGNORE_FORMS & {line.strip() for line in content.splitlines()}:
         return False
-    content = gitignore.read_text() if gitignore.exists() else ""
     separator = "\n" if content and not content.endswith("\n") else ""
-    gitignore.write_text(f"{content}{separator}{IGNORE_LINE}\n")
+    gitignore.write_text(f"{content}{separator}{IGNORE_LINE}\n", errors="surrogateescape")
     return True
 
 

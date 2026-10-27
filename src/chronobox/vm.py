@@ -23,6 +23,7 @@ import itertools
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -59,6 +60,8 @@ TRANSFER_TIMEOUT_S = 300.0
 READY_TIMEOUT_S = 30.0
 # A session folder without a lock (made by chronobox 0.1) counts as left over after this long.
 UNLOCKED_SESSION_AGE_S = 86400
+# A session folder this young may belong to a backend between creating its lock file and taking it.
+NEW_SESSION_GRACE_S = 60
 BYTES_PER_MIB = 1024 * 1024
 API_SOCKET_WAIT_S = 2.0
 CONTENT_LENGTH = "content-length"
@@ -125,15 +128,17 @@ def clean_sessions(directory: Path, *, dry_run: bool = False) -> list[LeftoverSe
     """
     leftovers = []
     for folder in sorted(directory.iterdir()) if directory.is_dir() else ():
-        if not folder.is_dir():
-            continue
-        lock = _free_session_lock(folder)
-        if lock is None:
-            continue
-        with lock or contextlib.nullcontext():
-            leftovers.append(LeftoverSession(folder, freed_bytes(folder)))
-            if not dry_run:
-                shutil.rmtree(folder, ignore_errors=True)
+        # A session that ends meanwhile deletes its own folder: skip it.
+        with contextlib.suppress(FileNotFoundError):
+            if not folder.is_dir():
+                continue
+            lock = _free_session_lock(folder)
+            if lock is None:
+                continue
+            with lock or contextlib.nullcontext():
+                leftovers.append(LeftoverSession(folder, freed_bytes(folder)))
+                if not dry_run:
+                    shutil.rmtree(folder, ignore_errors=True)
     return leftovers
 
 
@@ -142,20 +147,28 @@ def freed_bytes(folder: Path) -> int:
     also linked from outside it (a machine's image disk, a hard link to the VM files)."""
     links: dict[tuple[int, int], list[os.stat_result]] = {}
     for path in folder.rglob("*"):
-        info = path.lstat()
-        if path.is_file() and not path.is_symlink():
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(info.st_mode):
             links.setdefault((info.st_dev, info.st_ino), []).append(info)
     return sum(found[0].st_blocks * 512 for found in links.values() if len(found) == found[0].st_nlink)
 
 
 def _free_session_lock(folder: Path) -> TextIO | bool | None:
     """The session's lock if no backend holds it; ``False`` for an old unlocked folder left
-    long enough; ``None`` if the folder may still be in use."""
+    long enough; ``None`` if the folder may still be in use (or is too new to tell).
+
+    Raises:
+        FileNotFoundError: If the folder disappears meanwhile.
+    """
     lock_file = folder / IN_USE_LOCK
     if not lock_file.exists():
-        entries = [folder, *folder.glob("*"), *folder.glob("*/*")]
-        newest = max(entry.lstat().st_mtime for entry in entries)
+        newest = max(entry.lstat().st_mtime for entry in [folder, *folder.rglob("*")])
         return False if time.time() - newest > UNLOCKED_SESSION_AGE_S else None
+    if time.time() - lock_file.stat().st_mtime < NEW_SESSION_GRACE_S:
+        return None
     return try_lock_saved(folder)
 
 
@@ -342,7 +355,11 @@ class FirecrackerBackend:
         (self.root / "snapshots").mkdir(parents=True, exist_ok=True)
         # Held until cleanup: `chronobox clean` deletes only session folders whose lock is free.
         self._lock = (self.root / IN_USE_LOCK).open("a")
-        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._lock.close()
+            raise VMError(f"{self.root} is in use by another chronobox session") from None
         self.stats = BackendStats()
         self._ids = itertools.count()
         self._specs: dict[str, MachineSpec] = {}

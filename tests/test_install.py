@@ -3,6 +3,7 @@
 import fcntl
 import io
 import os
+import signal
 import tarfile
 import time
 from pathlib import Path
@@ -12,7 +13,15 @@ import pytest
 from chronobox import install, server
 from chronobox.cli import ignore_state, main
 from chronobox.install import FIRECRACKER_VERSION, SetupError, check_kvm, check_vm_files, fetch_firecracker
-from chronobox.vm import IN_USE_LOCK, UNLOCKED_SESSION_AGE_S, clean_sessions, freed_bytes
+from chronobox.vm import (
+    IN_USE_LOCK,
+    NEW_SESSION_GRACE_S,
+    UNLOCKED_SESSION_AGE_S,
+    FirecrackerBackend,
+    VMError,
+    clean_sessions,
+    freed_bytes,
+)
 
 
 def _session(root: Path, name: str, *, locked: bool | None) -> Path:
@@ -22,6 +31,8 @@ def _session(root: Path, name: str, *, locked: bool | None) -> Path:
     (folder / "vms" / "vm0" / "data.ext4").write_bytes(b"x" * 2**20)
     if locked is not None:
         (folder / IN_USE_LOCK).touch()
+        past_grace = time.time() - NEW_SESSION_GRACE_S - 1
+        os.utime(folder / IN_USE_LOCK, (past_grace, past_grace))
     return folder
 
 
@@ -140,3 +151,65 @@ def test_the_mcp_server_without_vm_files_exits_with_one_line(
         server.main(["--root", str(tmp_path / "root")])
     assert str(stopped.value.code).startswith("chronobox-mcp: missing firecracker, vmlinux, tools.ext4")
     assert "chronobox setup" in str(stopped.value.code)
+
+
+def test_a_session_just_created_is_never_cleaned(tmp_path: Path) -> None:
+    """A free lock younger than the grace period may be a backend about to take it: kept."""
+    young = _session(tmp_path, "starting", locked=False)
+    os.utime(young / IN_USE_LOCK)
+    assert clean_sessions(tmp_path) == [] and young.exists()
+
+
+def test_a_session_folder_that_disappears_while_cleaning_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session that ends during `chronobox clean` deletes its folder: no traceback, just skipped."""
+    _session(tmp_path, "ending", locked=False)
+
+    def vanished(folder: Path) -> None:
+        """Behave as if the folder was deleted under us."""
+        raise FileNotFoundError(folder)
+
+    monkeypatch.setattr("chronobox.vm._free_session_lock", vanished)
+    assert clean_sessions(tmp_path) == []
+
+
+def test_two_backends_on_one_root_are_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A second backend on a root another one holds gets a VMError, not a wait forever."""
+    vm_dir = tmp_path / "vm"
+    vm_dir.mkdir()
+    for name in ("firecracker", "vmlinux", "tools.ext4"):
+        (vm_dir / name).touch()
+    first = FirecrackerBackend(tmp_path / "root", vm_dir)
+    with pytest.raises(VMError, match="in use by another chronobox session"):
+        FirecrackerBackend(tmp_path / "root", vm_dir)
+    first._lock.close()
+
+
+def test_init_ignores_the_state_folder_in_a_subfolder_of_a_repository(tmp_path: Path) -> None:
+    """A project inside a monorepo gets its own .gitignore line."""
+    (tmp_path / ".git").mkdir()
+    project = tmp_path / "services" / "api"
+    project.mkdir(parents=True)
+    assert ignore_state(project)
+    assert (project / ".gitignore").read_text() == ".chronobox/\n"
+
+
+def test_a_stop_signal_deletes_the_session_and_exits(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """SIGTERM or SIGHUP from the MCP client: the session's folder goes, and the process exits with
+    128 + the signal (a stdio server would otherwise wait on stdin until killed, leaving it behind)."""
+    vm_dir = tmp_path / "vm"
+    vm_dir.mkdir()
+    for name in ("firecracker", "vmlinux", "tools.ext4"):
+        (vm_dir / name).touch()
+    backend = FirecrackerBackend(tmp_path / "session", vm_dir)
+
+    def exit_now(code: int) -> None:
+        """Stand in for os._exit."""
+        raise SystemExit(code)
+
+    monkeypatch.setattr(server.os, "_exit", exit_now)
+    with pytest.raises(SystemExit) as stopped:
+        server._stop_now(backend, signal.SIGTERM)
+    assert stopped.value.code == 128 + signal.SIGTERM
+    assert not (tmp_path / "session").exists()

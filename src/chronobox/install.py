@@ -8,6 +8,7 @@ image with Docker, into the VM folder (``default_vm_dir()``). Steps already done
 from __future__ import annotations
 
 import asyncio
+import http.client
 import os
 import platform
 import re
@@ -36,6 +37,8 @@ DOWNLOAD_TIMEOUT_S = 120
 CHUNK_BYTES = 1 << 20
 BYTES_PER_MIB = 1 << 20
 KVM = Path("/dev/kvm")
+BOOT_ERROR_LINES = 8
+FILE_A_BUG = "please report it: https://github.com/Geawher/chronobox/issues (with this output)"
 DOCKER_TIMEOUT_S = 20
 
 
@@ -121,7 +124,7 @@ def fetch_firecracker(vm_dir: Path, arch: str) -> None:
                 raise KeyError(member)
             partial = vm_dir / "firecracker.part"
             partial.write_bytes(binary.read())
-    except (KeyError, tarfile.TarError) as error:
+    except (KeyError, EOFError, tarfile.TarError) as error:
         raise SetupError(f"no Firecracker binary in {url}: {error}") from error
     finally:
         archive.unlink(missing_ok=True)
@@ -155,7 +158,7 @@ def read_url(url: str) -> bytes:
     try:
         with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as response:
             return response.read()
-    except OSError as error:
+    except (OSError, http.client.HTTPException) as error:
         raise SetupError(f"could not download {url}: {error}") from error
 
 
@@ -168,7 +171,7 @@ def download(url: str, target: Path) -> None:
     try:
         with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_S) as response, target.open("wb") as out:
             shutil.copyfileobj(response, out, CHUNK_BYTES)
-    except OSError as error:
+    except (OSError, http.client.HTTPException) as error:
         target.unlink(missing_ok=True)
         raise SetupError(f"could not download {url}: {error}") from error
 
@@ -249,9 +252,11 @@ async def check_boot(vm_dir: Path) -> Check:
             code, output = await machine.run("uname -sr", 30)
         finally:
             await backend.cleanup()
-    except VMError as error:
-        return Check("a machine boots", False, str(error).splitlines()[0], "see the error above")
+    except (VMError, OSError) as error:
+        lines = str(error).strip().splitlines() or [type(error).__name__]
+        details = "\n      ".join(lines[1:][-BOOT_ERROR_LINES:])
+        return Check("a machine boots", False, lines[0], details or FILE_A_BUG)
     if code != 0:
-        return Check("a machine boots", False, f"`uname -sr` failed: {output.strip()}", "see the error above")
+        return Check("a machine boots", False, f"`uname -sr` failed ({code}): {output.strip()}", FILE_A_BUG)
     seconds = time.monotonic() - started
     return Check("a machine boots", True, f"{output.strip()} in {seconds:.1f} s")
