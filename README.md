@@ -45,12 +45,12 @@ succeeded. chronobox gives the agent a machine where those mistakes are cheap:
 
 ```mermaid
 flowchart LR
-    main["main machine<br/>serving users"] -- fork --> copy["exact copy"]
-    copy -- "try the change,<br/>let time pass" --> worked{"worked?"}
-    worked -- yes --> apply["apply it on main"]
-    worked -- no --> discard["discard,<br/>try another way"]
+    main["main machine, serving users"] -->|fork| copy["exact copy"]
+    copy -->|"try the change, let time pass"| worked{"worked?"}
+    worked -->|yes| apply["apply it on main"]
+    worked -->|no| discard["discard, try another way"]
     discard --> copy
-    main -. "or verify_script" .-> handoff["a script replayed on a fresh copy,<br/>under traffic, killed and rerun"]
+    main -.->|or verify_script| handoff["a script replayed on a fresh copy, under traffic, killed and rerun"]
 ```
 
 There is no search or autopilot inside: the agent decides when to use the tools.
