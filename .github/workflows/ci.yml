@@ -6,8 +6,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync
-      - run: uv run ruff check src tests vm
-      - run: uv run ruff format --check src tests vm
+      - run: uv sync --locked
+      - run: uv run ruff check src tests vm docs
+      - run: uv run ruff format --check src tests vm docs
       # VM tests need /dev/kvm and a built image; they are skipped automatically here.
       - run: uv run pytest -q
+      # The package as users install it: it runs, and ships what `chronobox setup` builds from.
+      - run: uv build --wheel
+      - run: unzip -l dist/*.whl | grep -q chronobox/vm/images/default/Dockerfile
+      - run: uvx --from dist/*.whl chronobox --version

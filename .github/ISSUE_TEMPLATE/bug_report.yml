@@ -1,0 +1,24 @@
+name: Bug report
+description: Something does not work as the README says
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got (the full error line).
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: chronobox doctor
+      description: The output of `chronobox doctor`, and of `chronobox --version`.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup
+      description: Linux distribution, the MCP client and its version (e.g. Claude Code 2.1.x), and your chronobox.toml if a project is involved.

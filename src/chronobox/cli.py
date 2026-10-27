@@ -31,6 +31,7 @@ import sys
 import time
 from pathlib import Path
 
+import chronobox
 from chronobox import server
 from chronobox.config import (
     CONFIG_FILE,
@@ -341,6 +342,7 @@ def serve_mcp(args: argparse.Namespace) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line; options after ``mcp`` are left in ``server_args`` for the server."""
     parser = argparse.ArgumentParser(prog="chronobox", description=__doc__.splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"%(prog)s {chronobox.__version__}")
     parser.add_argument(
         "--vm-dir", type=Path, default=default_vm_dir(), help="where the VM files live (CHRONOBOX_VM_DIR)"
     )

@@ -1,12 +1,32 @@
 [project]
 name = "chronobox"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Linux machine with exact undo and forks for coding agents (MCP server, Firecracker microVMs)."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+authors = [{ name = "Jawher Jabri" }]
 requires-python = ">=3.12"
 dependencies = ["mcp>=2.3.0"]
+keywords = ["mcp", "ai-agents", "coding-agents", "firecracker", "microvm", "snapshots", "claude-code", "devops"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.urls]
+Homepage = "https://github.com/Geawher/chronobox"
+Issues = "https://github.com/Geawher/chronobox/issues"
+Changelog = "https://github.com/Geawher/chronobox/blob/main/CHANGELOG.md"
+Benchmark = "https://github.com/Geawher/chronobox-ops"
 
 [project.scripts]
 chronobox = "chronobox.cli:main"
