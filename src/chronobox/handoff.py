@@ -34,6 +34,7 @@ A replay can also run in the background, collected later with ``verify_result``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import io
 import itertools
@@ -54,6 +55,7 @@ from chronobox.project import (
     ProjectError,
     _git_diff,
     _unpack_for_diff,
+    local_edits,
     pack_project,
     project_diff,
 )
@@ -115,7 +117,7 @@ BASHISMS = {
     "source": re.compile(r"^\s*source\s", re.MULTILINE),
     "arrays": re.compile(r"\b\w+=\("),
     "here-strings (<<<)": re.compile(r"<<<"),
-    "${var//...} or ${var:N}": re.compile(r"\$\{\w+(//|:-?\d)"),
+    "${var//...} or ${var:N}": re.compile(r"\$\{\w+(//|:\d|: +-\d)"),
     "&> redirections": re.compile(r"&>"),
     "declare / let": re.compile(r"^\s*(declare|let)\s", re.MULTILINE),
 }
@@ -359,8 +361,12 @@ class Project:
             VMError: If the files cannot be read from the machine.
         """
         if code_from == LOCAL:
-            archive = await asyncio.to_thread(pack_project, self.config)
-            start = await asyncio.to_thread(self.boot.copied.read_bytes)
+            # Only what was edited locally: the fork's folder is the machine after `setup`, and the
+            # untouched local copies of files setup changed must not overwrite them.
+            copied = await asyncio.to_thread(self.boot.copied.read_bytes)
+            current = await asyncio.to_thread(pack_project, self.config)
+            archive, _, deleted = await asyncio.to_thread(local_edits, copied, current)
+            return archive, set(deleted)
         else:
             machine = workspace.machine(code_from)
             archive = await machine.get(self.config.target, exclude=self.config.exclude)
@@ -420,7 +426,10 @@ class ReplayRun:
         try:
             await self._run(scripts)
         except _Stopped:
-            await self.stop_loads()
+            pass
+        finally:
+            with contextlib.suppress(VMError, OSError):  # the fork is gone or broken: so is its traffic
+                await self.stop_loads()
 
     async def step(self, label: str, command: str, timeout: float = CHECK_TIMEOUT_S) -> Step:
         """Run ``command`` in the project folder; record it in the report and the fork's history."""
@@ -546,8 +555,11 @@ class ReplayRun:
             if scripts.rollback.strip() and self.replay.succeeded:
                 await self._rollback()
         finally:
-            for at, crash in await asyncio.gather(*crashes):
-                self._merge(at, crash)
+            for result in await asyncio.gather(*crashes, return_exceptions=True):
+                if isinstance(result, BaseException):
+                    self.replay.notes.append(f"a crash test could not finish: {result!r}")
+                else:
+                    self._merge(*result)
 
     async def _sample(self) -> None:
         """Run the sample commands (the project's, then the agent's), which shrink the data.
@@ -657,8 +669,11 @@ class ReplayRun:
         except (VMError, OSError) as error:
             crash.notes.append(f"the crash test could not finish: {error}")
         if crash.succeeded:
-            del self.workspace.forks[name]
-            await backend.stop(machine)
+            self.workspace.forks.pop(name, None)
+            try:
+                await backend.stop(machine)
+            except (VMError, OSError) as error:
+                crash.notes.append(f"the copy could not be stopped: {error}")
         return point.at, crash
 
     def _merge(self, at: float, crash: Replay) -> None:
@@ -750,12 +765,26 @@ class ReplayRun:
         reference = self.workspace.machine(self.reference)
         for command in self.settings.compare:
             wrapped = f"cd {shlex.quote(self.folder)} && {command}"
-            (_, expected), (code, actual) = await asyncio.gather(
-                reference.run(wrapped, CHECK_TIMEOUT_S), self.machine.run(wrapped, CHECK_TIMEOUT_S)
+            (expected_code, expected), (code, actual) = await asyncio.gather(
+                reference.run(wrapped, CHECK_TIMEOUT_S, isolated=True),
+                self.machine.run(wrapped, CHECK_TIMEOUT_S, isolated=True),
             )
+            if expected_code != 0 or code != 0:
+                self.record(Step(f"[handoff] compare `{command}`", code or expected_code, "failed", 0.0))
+                failed = f"{self.reference} (exit {expected_code})" if expected_code else ""
+                failed += (" and " if failed and code else "") + (f"the replay (exit {code})" if code else "")
+                self.problem(f"the project's compare `{command}` failed on {failed}, so it shows nothing: "
+                             f"{_shorten(actual if code else expected, STEP_OUTPUT_LIMIT)}")  # fmt: skip
+                continue
             same = expected.strip() == actual.strip()
             self.record(Step(f"[handoff] compare `{command}`", code, "same" if same else "different", 0.0))
-            if not same:
+            if not same and self.replay.sampled:
+                # Only the replay's data was shrunk: a compare of the data differs anyway.
+                self.replay.notes.append(
+                    f"[handoff] compare `{command}` differs from {self.reference}, but the replay ran on a "
+                    "sample of the data: replay the full data to compare"
+                )
+            elif not same:
                 self.problem(difference(command, self.reference, expected, actual))
 
     async def _restarts(self, before: dict[int, Listener]) -> None:
@@ -798,7 +827,9 @@ class ReplayRun:
 
     async def _listeners(self, machine: Machine) -> dict[int, Listener]:
         """The processes listening on TCP ports, by port (empty if they cannot be read)."""
-        code, output = await machine.run(LISTENERS, CHECK_TIMEOUT_S)
+        # Not isolated (an isolated command does not see the machine's listeners): in a subshell, so
+        # its variables do not stay in the agent's shell on main.
+        code, output = await machine.run(f"(\n{LISTENERS}\n)", CHECK_TIMEOUT_S)
         listeners = {}
         for line in output.splitlines() if code == 0 else []:
             parts = line.split("\t")
@@ -991,6 +1022,8 @@ def handoff_tools(
     target = project.config.target if project is not None else "/root"
     replays: dict[str, tuple[asyncio.Task[str], Replay]] = {}
     numbers = itertools.count(1)
+    # The replay started last: only its result saves or withdraws the hand-off, whatever finishes first.
+    newest = [""]
 
     async def replay_and_save(scripts: Scripts, replay: Replay, options: Options, goal: str) -> str:
         """Replay; on success (and the review, if any) save the hand-off, on failure withdraw the
@@ -998,6 +1031,11 @@ def handoff_tools(
         try:
             await replay_script(workspace, project, settings, scripts, replay, options)
             report = replay.report()
+            if replay.fork != newest[0]:
+                return (
+                    f"{report}\nnot saved: {newest[0]} was started after this replay, and the hand-off is "
+                    f"what the newest replay shows (collect it with verify_result(fork={newest[0]!r}))"
+                )
             if not replay.succeeded:
                 gone = withdraw_handoff(folder, withdrawn)
                 note = f" The hand-off saved before was withdrawn (moved to {withdrawn})." if gone else ""
@@ -1056,6 +1094,7 @@ def handoff_tools(
         options = Options(check, load, load_check, sample, bool(twice), timeout)
         await _close_old_replays(workspace, replays)
         replay = Replay(_free_fork_name(workspace, replays, numbers), checkpoint, code_from)
+        newest[0] = replay.fork
         task = asyncio.create_task(replay_and_save(scripts, replay, options, goal))
         replays[replay.fork] = (task, replay)
         if background:

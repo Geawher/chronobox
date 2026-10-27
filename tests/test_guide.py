@@ -21,6 +21,15 @@ def test_a_new_guide_names_the_project_services_and_folder(tmp_path: Path) -> No
     assert result.created and not result.claude_hint
     assert text.startswith(START_MARKER) and text.rstrip().endswith(END_MARKER)
     assert "services (db)" in text and "`/src`" in text and "verify_script" in text
+    assert "Change the machine, or hand over a script?" in text and "ask; if nobody can answer" in text
+
+
+def test_a_project_without_hand_offs_gets_no_hand_off_guide(tmp_path: Path) -> None:
+    """``[handoff] enabled = false``: the guide only tells agents how to change the machine."""
+    (tmp_path / "chronobox.toml").write_text(TOML + "[handoff]\nenabled = false\n")
+    write_guide(load_config(tmp_path))
+    text = (tmp_path / AGENTS_FILE).read_text()
+    assert "verify_script" not in text and "hand over" not in text and "Trying things safely" in text
 
 
 def test_the_guide_is_added_to_an_existing_file_and_replaced_in_place(tmp_path: Path) -> None:
@@ -47,3 +56,14 @@ def test_a_claude_md_without_the_import_gets_a_hint_not_an_edit(tmp_path: Path) 
     assert (folder / CLAUDE_FILE).read_text() == "Be nice.\n"
     (folder / CLAUDE_FILE).write_text("Be nice.\n@AGENTS.md\n")
     assert not write_guide(load_config(folder)).claude_hint
+
+
+def test_markers_out_of_order_get_a_fresh_guide_instead_of_a_crash(tmp_path: Path) -> None:
+    """An end marker above the start marker (a hand edit) is not a section: the guide is added after
+    the text instead of failing."""
+    folder = _project(tmp_path)
+    (folder / AGENTS_FILE).write_text(f"{END_MARKER}\nOur rules.\n{START_MARKER}\n")
+    write_guide(load_config(folder))
+    text = (folder / AGENTS_FILE).read_text()
+    assert text.startswith(f"{END_MARKER}\nOur rules.") and text.rstrip().endswith(END_MARKER)
+    assert "Working with chronobox" in text
