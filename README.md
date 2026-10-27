@@ -127,7 +127,7 @@ env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 
 ```bash
 cd path/to/app
-chronobox init                     # a starter chronobox.toml (never overwrites one)
+chronobox init                     # a starter chronobox.toml (never overwrites one) and AGENTS.md guide
 chronobox build --project .        # the image it declares, once
 chronobox warm                     # optional: prepare the warm start now, not in the first session
 claude mcp add chronobox -- chronobox mcp --project .
@@ -152,6 +152,48 @@ claude mcp add chronobox -- chronobox mcp --project .
   - `sync(where)`: copy local edits of the project's files (new, changed, deleted since the
     session started) into main or a fork, for an agent that edits files locally but needs the
     machine to run them.
+- **Hand-off scripts**: some changes are actions, not file edits (a migration, a backfill,
+  restarting services, a setting outside the project). The agent writes them as a script and
+  calls `verify_script(script, check)`, which replays it the way you will run it (`./apply.sh`:
+  its `#!` line picks the shell, `/bin/sh` without one): on a new fork of the `start` checkpoint
+  (the machine before the agent's work), after deploying the project's changed files (from main,
+  a fork, or with `code_from="local"` the files edited locally). The replay passes only if:
+  - the script succeeds, and again when run a second time, quickly (a retry must not redo the
+    whole job), and when killed midway and run again, on copies of the replay snapshotted while
+    it ran (deployments get retried, sometimes after a crash);
+  - the agent's `check` passes (it is required), and the project's checks;
+  - the traffic run during the replay (the project's, and the agent's own `load`) lost nothing
+    (`load_check`);
+  - every service still answers its `ready` command, and a project process the agent restarted
+    on its machine was restarted by the script too.
+
+  Optional scripts are replayed in their place and handed over: `assume` (what the change relies
+  on, run first: you stop if it fails), `pre` (before the new files, with the old code running)
+  and `rollback` (once the old files are back). `sample` shrinks the replay's data so a long
+  operation's logic is checked in minutes (the report says it ran on a sample), and
+  `background=true` returns at once, the result coming from `verify_result`. Then the patch, the
+  scripts and the replay's report are saved in `.chronobox/exports/handoff/`, ready for the real
+  machine; a failed replay withdraws the hand-off saved before (to `handoff-withdrawn/`).
+- **`[handoff]`**: what you know about production, added to every replay so the agent's own check
+  is not the only one:
+
+  ```toml
+  [handoff]
+  prepare = ["bin/more-data"]           # make the replay look more like production first
+  load = "bin/traffic"                  # users' traffic, running during the replay
+  load_check = "bin/traffic --report"   # after it: fails if users lost writes
+  checks = ["bin/smoke-test"]           # must pass after the script
+  compare = ["pg_dump -s -U postgres"]  # same output on the agent's machine and on the replay
+  sample = ["bin/keep-a-tenth"]         # optional: every replay on a sample of the data
+  ```
+
+  `compare` catches a script that does not reproduce what the agent tested (a column it added
+  by hand, a setting it forgot); the [example](examples/notes/chronobox.toml) compares the schema
+  and the API's fields, with [traffic.py](examples/notes/traffic.py) as its users.
+- **A guide for agents**: `chronobox init` (or `chronobox guide`, to refresh it) writes how to work
+  with the machine into the project's `AGENTS.md`, between marker lines, keeping the rest of the
+  file. Codex, Cursor and others read AGENTS.md; Claude Code reads it when the project has no
+  `CLAUDE.md` (otherwise add a line `@AGENTS.md` to CLAUDE.md, which `chronobox guide` reminds you).
 - Machines have no network: install everything in the image.
 
 To work on the same machine as the agent, keep it running yourself:
@@ -183,14 +225,17 @@ data), `--mem`, `--disk`.
 | `compare(command, forks)` | chronobox | the same command on main and forks, side by side |
 | `changes(name)` | chronobox | commands, failures and files a fork changed |
 | `promote(name)` / `discard(name, lesson)` | chronobox | keep a fork as main / drop it, with a report |
-| `diff(where)` / `export(path, where)` | chronobox, with `--project` | the project's changes as a patch / copy files out |
+| `diff(where)` / `export(path, where)` / `sync(where)` | all, with `--project` | the project's changes as a patch / copy files out / copy local edits in |
+| `verify_script(script, check, ...)` / `verify_result(fork, wait)` | chronobox, with `--project` or `--handoff` | replay a change script on a fresh fork (retries, kills, traffic, the project's checks), then save the hand-off / collect a replay run in the background |
 
 With `--profile chronobox`, risky commands (deletes, kills, restarts, SQL changes,
 overwrites) are checkpointed automatically first.
 
 The tool descriptions steer the agent to the safe pattern on a machine that serves
 users: fork, try the change and let time pass on the fork, then apply the verified
-change to the main machine. A rollback is exact, so it also undoes the writes users
+change to the main machine. They also say when not to: a rehearsal takes as long as the real
+thing, so when users are failing now the agent first takes a small step it knows is safe to stop
+the damage, and rehearses only what it is unsure of. A rollback is exact, so it also undoes the writes users
 made since the checkpoint; on a machine that takes writes, fixing forward is usually
 better.
 
@@ -231,9 +276,10 @@ lazily; checkpoints are files on disk.
 ```
 src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints, forks,
                  reports, lessons, guard) · commands.py · service.py · server.py (MCP)
-                 images.py · cli.py (`chronobox build`, `images`, `warm`, `up`, `cp`, `down`, `mcp`)
-                 config.py (chronobox.toml) · project.py (bring a project up, warm start, diff,
-                 export) · copying.py (`chronobox cp`)
+                 images.py · cli.py (`chronobox build`, `images`, `init`, `guide`, `warm`, `up`, `cp`,
+                 `down`, `mcp`) · config.py (chronobox.toml) · project.py (bring a project up, warm
+                 start, diff, export, sync) · handoff.py (`verify_script`) · guide.py (AGENTS.md)
+                 · copying.py (`chronobox cp`)
 vm/              tools/ (tools drive: init, guest agent) · images/default/ · fetch.sh · build_rootfs.sh
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
 examples/notes/  a web app + PostgreSQL project with its chronobox.toml
