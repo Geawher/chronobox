@@ -420,6 +420,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.http and not args.connect:
         parser.error("--http needs --connect")
+    if args.handoff and not args.connect:
+        parser.error("--handoff goes with --connect (without it, use --handoff-dir or a project)")
     if args.project and args.handoff_dir:
         parser.error("--handoff-dir does not go with --project (hand-offs go to its .chronobox/exports)")
     if args.project and args.setup:

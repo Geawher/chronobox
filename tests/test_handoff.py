@@ -68,6 +68,13 @@ def test_bash_features_are_flagged_only_in_scripts_that_run_with_sh() -> None:
     assert bash_features("echo plain\n") == []
 
 
+def test_posix_default_values_are_not_taken_for_bash_substrings() -> None:
+    """``${PORT:-8080}`` is POSIX (a default value); ``${v:2}`` and ``${v: -2}`` are bash substrings."""
+    assert bash_features("echo ${PORT:-8080} ${BATCH:-1000} ${NAME:-x}\n") == []
+    assert bash_features("echo ${v:2}\n") == ["${var//...} or ${var:N}"]
+    assert bash_features("echo ${v: -2}\n") == ["${var//...} or ${var:N}"]
+
+
 def test_a_difference_says_which_side_lacks_what() -> None:
     """A comparison that differs names what only the agent's machine has (the script misses it) and
     what only the replay has (the agent's machine lacks it), with what to do about each."""
@@ -302,6 +309,41 @@ async def test_local_edits_are_deployed_and_handed_over_with_code_from_local(
 
 
 @pytest.mark.vm
+async def test_code_from_local_deploys_only_the_local_edits_over_what_setup_made(tmp_path: Path) -> None:
+    """A file that ``setup`` changed on the machine keeps setup's version on the replay; only the
+    files edited locally since the copy are deployed (as ``sync`` does)."""
+    folder = tmp_path / "notes"
+    shutil.copytree(EXAMPLE, folder)
+    (folder / "settings.txt").write_text("from the repository\n")
+    config = folder / "chronobox.toml"
+    setup = 'setup = ["python3 migrate.py", "echo made by setup >> settings.txt"]'
+    config.write_text(config.read_text().replace('setup = ["python3 migrate.py"]', setup))
+    project = load_config(folder)
+    async for _, verify in _start(project, tmp_path):
+        (folder / "NOTES.md").write_text("# local notes\n")
+        reply = await verify(
+            "grep -q 'made by setup' settings.txt && grep -q 'local notes' NOTES.md", check="true",
+            code_from="local", twice=False,
+        )  # fmt: skip
+        assert "passed" in reply, reply
+
+
+@pytest.mark.vm
+async def test_a_compare_command_that_fails_is_a_problem_not_a_match(tmp_path: Path) -> None:
+    """A ``[handoff] compare`` command that fails the same way on both machines shows nothing, so the
+    replay does not pass on it."""
+    folder = tmp_path / "notes"
+    shutil.copytree(EXAMPLE, folder)
+    config = folder / "chronobox.toml"
+    config.write_text(config.read_text().split("\n# What `verify_script` adds")[0]
+                      + '\n[handoff]\ncompare = ["cat /no-such-file"]\n')  # fmt: skip
+    async for _, verify in _start(load_config(folder), tmp_path):
+        reply = await verify("true", check="true", twice=False)
+        assert "compare `cat /no-such-file` failed on main (exit 1) and the replay (exit 1)" in reply, reply
+        assert "not saved" in reply
+
+
+@pytest.mark.vm
 async def test_pre_and_rollback_scripts_are_replayed_in_their_place(
     plain_session: tuple[Workspace, Method], plain: ProjectConfig
 ) -> None:
@@ -424,6 +466,23 @@ async def test_a_replay_in_the_background_is_collected_with_verify_result(
     done = await tools["verify_result"]("replay-1", 120)
     assert "passed" in done and "hand-off saved" in done, done
     assert "no replay is waiting" in await tools["verify_result"]()
+
+
+@pytest.mark.vm
+async def test_only_the_newest_replay_decides_the_handoff(
+    bare: tuple[Workspace, dict[str, Method]], tmp_path: Path
+) -> None:
+    """A background replay of an old script that ends after a newer replay was started saves
+    nothing: the hand-off is the newer script's, whatever finishes last."""
+    _, tools = bare
+    verify = tools["verify_script"]
+    old = await verify("sleep 8; echo old version", check="true", twice=False, background=True)
+    assert "on fork 'replay-1'" in old, old
+    new = await verify("echo new version", check="true", twice=False)
+    assert "hand-off saved" in new, new
+    late = await tools["verify_result"]("replay-1", 120)
+    assert "not saved: replay-2 was started after this replay" in late, late
+    assert "new version" in (tmp_path / "out" / "handoff" / SCRIPT_FILE).read_text()
 
 
 @pytest.mark.vm

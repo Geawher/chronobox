@@ -127,7 +127,7 @@ def write_guide(config: ProjectConfig) -> GuideResult:
     section = guide_section(config)
     created = not file.exists()
     text = "" if created else file.read_text()
-    if START_MARKER in text and END_MARKER in text:
+    if START_MARKER in text and END_MARKER in text.split(START_MARKER, 1)[1]:
         before, rest = text.split(START_MARKER, 1)
         after = rest.split(END_MARKER, 1)[1].removeprefix("\n")
         text = f"{before}{section}{after}"

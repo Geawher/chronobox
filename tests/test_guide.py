@@ -56,3 +56,14 @@ def test_a_claude_md_without_the_import_gets_a_hint_not_an_edit(tmp_path: Path) 
     assert (folder / CLAUDE_FILE).read_text() == "Be nice.\n"
     (folder / CLAUDE_FILE).write_text("Be nice.\n@AGENTS.md\n")
     assert not write_guide(load_config(folder)).claude_hint
+
+
+def test_markers_out_of_order_get_a_fresh_guide_instead_of_a_crash(tmp_path: Path) -> None:
+    """An end marker above the start marker (a hand edit) is not a section: the guide is added after
+    the text instead of failing."""
+    folder = _project(tmp_path)
+    (folder / AGENTS_FILE).write_text(f"{END_MARKER}\nOur rules.\n{START_MARKER}\n")
+    write_guide(load_config(folder))
+    text = (folder / AGENTS_FILE).read_text()
+    assert text.startswith(f"{END_MARKER}\nOur rules.") and text.rstrip().endswith(END_MARKER)
+    assert "Working with chronobox" in text

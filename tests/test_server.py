@@ -82,6 +82,13 @@ def test_a_project_offers_hand_offs_unless_it_or_the_server_opts_out(
         assert "Asked to make a change" in note and "do not hand over a script" in note
 
 
+def test_handoff_without_connect_is_refused() -> None:
+    """``--handoff`` only tells a front end that its ``--serve`` side has hand-offs; alone it would
+    offer tools with nothing behind them."""
+    with pytest.raises(SystemExit):
+        parse_args(["--handoff"])
+
+
 async def test_a_plain_machine_with_no_handoff_has_no_verify_script() -> None:
     """``--no-handoff`` wins over ``--handoff`` on a machine without a project."""
     assert not _handoff(parse_args(["--connect", "m.sock", "--handoff", "--no-handoff"]))
