@@ -180,12 +180,13 @@ from the agent's copy (more rows, another leader), killed it halfway and ran it 
 
 | Model | Alone, live | chronobox, live | chronobox hand-off |
 |---|---|---|---|
-| Sonnet 5.5 | 17/30, harm 13, $0.15 | 20/30, harm 9, $0.19 | **24/30, harm 5**, $0.22 |
-| Opus 4.8 | 18/30, harm 10, $1.64 | 22/30, harm 7, $1.89 | 18/30, harm 6, $2.12+ |
+| Sonnet 5.5 | 17/30, harm 13, $0.15 | 20/30, harm 9, $0.19+ | **24/30, harm 5**, $0.22+ |
+| Opus 4.8 | 18/30, harm 10, $1.64+ | 22/30, harm 7, $1.89+ | 18/30, harm 6, $2.12+ |
 | Opus 5.5 | 28/30, harm 2, $0.42 | 28/30, harm 2, $0.44 | **30/30, harm 0**, $1.12 |
 
 The hand-off was the safest way to work for every model, and Sonnet 5.5's hand-offs beat Opus
-4.8 working live. Three seeds per cell, and the live columns ran a week earlier on older Claude
+4.8 working live. A "+" marks costs that leave out runs killed at the 30-minute limit, which
+record none. Three seeds per cell, and the live columns ran a week earlier on older Claude
 Code and chronobox versions: read these as directions, not final numbers.
 
 ### Where it does not help
