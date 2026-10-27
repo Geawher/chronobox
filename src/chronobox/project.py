@@ -323,8 +323,12 @@ class ProjectBoot:
                 log.warning("could not save the warm start %s: %s", warm, error)
             return
         _prune_warm(warm)
-        # Saving is when the cache grows: also drop the warm starts of projects that are gone.
-        clean_warm_starts(warm.parent.parent, unused_for_s=None)
+        # Saving is when the cache grows: also drop the warm starts of projects that are gone. Like
+        # saving itself, this never fails the session.
+        try:
+            clean_warm_starts(warm.parent.parent, unused_for_s=None)
+        except OSError as error:
+            log.warning("could not clean the warm-start cache %s: %s", warm.parent.parent, error)
 
 
 def _prune_warm(keep: Path) -> None:
@@ -379,6 +383,8 @@ def list_warm_starts(warm_dir: Path) -> list[WarmStart]:
     starts = []
     for folder in sorted(warm_dir.glob(f"*/*/{WARM_COMPLETE}")):
         folder = folder.parent
+        if folder.name.endswith(PARTIAL_SUFFIX):  # still being written (or left by a crash): not one yet
+            continue
         recorded = folder.parent / WARM_PROJECT
         try:
             project = Path(recorded.read_text().strip()) if recorded.is_file() else None
@@ -414,17 +420,30 @@ def clean_warm_starts(
         stale = unused_for_s is not None and now - start.last_used > unused_for_s
         if not (everything or start.project_gone or stale):
             continue
-        if dry_run:
-            deleted.append(start)
-            continue
-        lock = try_lock_saved(start.folder)
-        if lock is None:
-            continue
-        with lock:
-            shutil.rmtree(start.folder, ignore_errors=True)
-        deleted.append(start)
-        _remove_if_empty(start.folder.parent)
+        try:
+            if _delete_warm_start(start, dry_run=dry_run):
+                deleted.append(start)
+        except OSError as error:  # another session or `chronobox clean` deleted it meanwhile
+            log.info("skipping warm start %s: %s", start.folder, error)
     return deleted
+
+
+def _delete_warm_start(start: WarmStart, *, dry_run: bool) -> bool:
+    """Delete one warm start (with its project folder once empty) unless a session borrows it;
+    with ``dry_run`` only check that it could be. Whether it was (or would be) deleted.
+
+    Raises:
+        OSError: If it disappears meanwhile.
+    """
+    lock = try_lock_saved(start.folder)
+    if lock is None:
+        return False
+    with lock:
+        if not dry_run:
+            shutil.rmtree(start.folder, ignore_errors=True)
+    if not dry_run:
+        _remove_if_empty(start.folder.parent)
+    return True
 
 
 def _remove_if_empty(project_folder: Path) -> None:

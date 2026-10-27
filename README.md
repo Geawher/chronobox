@@ -183,7 +183,10 @@ claude mcp add chronobox -- chronobox mcp --project .
   saved machine is also the session's `start` checkpoint.
   A project keeps one warm start (a new one replaces the old); `chronobox clean` deletes those of
   projects that are gone (moved, deleted, a removed worktree) or unused for 30 days
-  (`--unused-days N`, `--all`, `--dry-run` to list them with their size first).
+  (`--unused-days N`, `--all`, `--dry-run` to list them with their size first). Saving a warm
+  start also deletes those of gone projects. "Gone" means its `chronobox.toml` cannot be found at
+  that moment, which also happens on a branch without one or on an unmounted drive: that project
+  then boots fresh once and saves a new warm start.
 - Three more tools:
   - `diff(where)`: what changed in the project on main or a fork since the machine was
     ready, as a patch for your local copy (`git apply` takes it; your own edits since then,

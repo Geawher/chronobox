@@ -3,6 +3,7 @@
 import fcntl
 import io
 import os
+import shutil
 import subprocess
 import tarfile
 import time
@@ -10,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from chronobox import project as project_module
 from chronobox.config import Service, load_config
 from chronobox.images import TOOLS_DISK, image_disk
 from chronobox.project import (
@@ -222,7 +224,7 @@ def test_cleaning_drops_gone_and_unused_projects_but_never_one_in_use(tmp_path: 
     with (borrowed / "in-use.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_SH)
         preview = clean_warm_starts(warm_dir, unused_for_s=30 * 86400, dry_run=True)
-        assert {start.folder for start in preview} == {old, gone, borrowed}
+        assert {start.folder for start in preview} == {old, gone}  # a dry run skips what is in use too
         assert old.exists()
         deleted = clean_warm_starts(warm_dir, unused_for_s=30 * 86400)
     assert {start.folder for start in deleted} == {old, gone}
@@ -240,6 +242,26 @@ def test_cleaning_everything_and_only_gone_projects(tmp_path: Path) -> None:
     assert kept.exists() and not (warm_dir / "p1").exists()
     clean_warm_starts(warm_dir, unused_for_s=None, everything=True)
     assert list(warm_dir.iterdir()) == []
+
+
+def test_a_half_written_warm_start_is_not_listed_or_cleaned(tmp_path: Path) -> None:
+    """A ``.partial`` folder (being saved, or left by a crash) is not a warm start yet."""
+    warm_dir = tmp_path / "warm"
+    partial = _warm_start(warm_dir, "p1", "k1.abcd1234.partial", tmp_path / "gone.toml", days_unused=0)
+    assert list_warm_starts(warm_dir) == []
+    assert clean_warm_starts(warm_dir, unused_for_s=None, everything=True) == [] and partial.exists()
+
+
+def test_a_warm_start_deleted_meanwhile_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Another session (or ``chronobox clean``) deleting a warm start between the listing and the
+    delete is not an error: the others are still cleaned."""
+    warm_dir = tmp_path / "warm"
+    first = _warm_start(warm_dir, "p1", "k1", tmp_path / "gone1.toml", days_unused=0)
+    second = _warm_start(warm_dir, "p2", "k2", tmp_path / "gone2.toml", days_unused=0)
+    listed = list_warm_starts(warm_dir)
+    shutil.rmtree(first.parent)
+    monkeypatch.setattr(project_module, "list_warm_starts", lambda _: listed)
+    assert [start.folder for start in clean_warm_starts(warm_dir, unused_for_s=None)] == [second]
 
 
 def test_a_patch_with_added_changed_and_deleted_files_applies_with_git(tmp_path: Path) -> None:
