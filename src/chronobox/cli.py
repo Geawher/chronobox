@@ -1,5 +1,7 @@
 """Build chronobox machine images, prepare projects and serve them to agents.
 
+    chronobox setup                                  # download and build the VM files, once
+    chronobox doctor                                 # check this host runs machines (boots one)
     chronobox build --tools                          # the tools drive, once
     chronobox build --image postgres:16              # any Docker image, as is
     chronobox build --dockerfile ./Dockerfile        # or one built from a Dockerfile
@@ -8,7 +10,7 @@
     chronobox init                                   # a starter chronobox.toml (and AGENTS.md guide) here
     chronobox guide                                  # write or refresh the chronobox guide in AGENTS.md
     chronobox warm                                   # boot the project here once, save its warm start
-    chronobox clean                                  # delete unused warm starts (--dry-run lists them)
+    chronobox clean                                  # delete unused warm starts and crashed sessions
     chronobox up                                     # keep the project's machine running
     chronobox cp ./fixtures main:/src/fixtures       # copy into it (or out: main:/src/app.py ./out)
     chronobox down                                   # stop it
@@ -41,23 +43,44 @@ from chronobox.config import (
 from chronobox.copying import CopyError, check_direction, pack_local, parse_location, unpack_local
 from chronobox.guide import CLAUDE_FILE, CLAUDE_IMPORT, write_guide
 from chronobox.images import Image, ImageError, build_image, build_tools, list_images
+from chronobox.install import SetupError, doctor, setup
 from chronobox.project import (
     ProjectBoot,
     WarmStart,
     clean_warm_starts,
     default_warm_dir,
     list_warm_starts,
-    session_root,
     up_socket,
 )
 from chronobox.service import Op, ServiceError, get_remote, is_serving, put_remote, request
-from chronobox.vm import FirecrackerBackend, VMError, default_vm_dir
+from chronobox.vm import FirecrackerBackend, VMError, clean_sessions, default_vm_dir, sessions_dir
 
 BYTES_PER_MIB = 1024 * 1024
+GITIGNORE = ".gitignore"
+IGNORE_LINE = ".chronobox/"
+IGNORE_FORMS = {".chronobox", ".chronobox/", "/.chronobox", "/.chronobox/"}
 BYTES_PER_GIB = 1024 * BYTES_PER_MIB
 SECONDS_PER_DAY = 86400
 DEFAULT_UNUSED_DAYS = 30
 MAX_SOCKET_PATH = 107  # bytes in sockaddr_un.sun_path, without the final NUL
+
+
+def run_setup(args: argparse.Namespace) -> None:
+    """``chronobox setup``: download Firecracker and the kernel, build the tools drive and default image."""
+    setup(args.vm_dir)
+
+
+def run_doctor(args: argparse.Namespace) -> None:
+    """``chronobox doctor``: one line per requirement, then exit 1 if a required one failed."""
+    checks = doctor(args.vm_dir)
+    for check in checks:
+        mark = "ok  " if check.ok else ("FAIL" if check.required else "warn")
+        print(f"{mark}  {check.name}: {check.detail}")
+        if not check.ok:
+            print(f"      fix: {check.fix}")
+    if any(check.required and not check.ok for check in checks):
+        sys.exit(1)
+    print("chronobox is ready")
 
 
 def build(args: argparse.Namespace) -> None:
@@ -134,10 +157,27 @@ def init(args: argparse.Namespace) -> None:
         "claude mcp add chronobox -- chronobox mcp --project .",
     ]
     print(f"wrote {file}")
+    if ignore_state(folder):
+        print(f"added {IGNORE_LINE} to {folder / GITIGNORE} (hand-offs and exports go there)")
     say_guide(load_config(folder))
     print("next: add the project's services and setup, then:")
     for step in steps:
         print(f"  {step}")
+
+
+def ignore_state(folder: Path) -> bool:
+    """In a git repository, add ``.chronobox/`` to its ``.gitignore`` unless it is there already;
+    return whether it was added."""
+    if not (folder / ".git").exists():
+        return False
+    gitignore = folder / GITIGNORE
+    lines = gitignore.read_text().splitlines() if gitignore.exists() else []
+    if IGNORE_FORMS & {line.strip() for line in lines}:
+        return False
+    content = gitignore.read_text() if gitignore.exists() else ""
+    separator = "\n" if content and not content.endswith("\n") else ""
+    gitignore.write_text(f"{content}{separator}{IGNORE_LINE}\n")
+    return True
 
 
 def guide(args: argparse.Namespace) -> None:
@@ -171,10 +211,11 @@ def warm(args: argparse.Namespace) -> None:
 
 
 def clean(args: argparse.Namespace) -> None:
-    """``chronobox clean``: delete warm starts of projects that are gone or unused for a while.
+    """``chronobox clean``: delete warm starts of projects that are gone or unused for a while, and
+    what sessions that were killed or crashed left behind.
 
-    Warm starts in use by a running session are kept. With ``--dry-run`` nothing is deleted:
-    every warm start is listed, marked with whether it would go.
+    Warm starts and sessions in use are kept. With ``--dry-run`` nothing is deleted: every warm
+    start is listed, marked with whether it would go, and so is every left-over session.
     """
     warm_dir = default_warm_dir()
     unused_for_s = args.unused_days * SECONDS_PER_DAY
@@ -186,6 +227,13 @@ def clean(args: argparse.Namespace) -> None:
     freed = sum(start.size_bytes for start in going)
     verb = "would free" if args.dry_run else "freed"
     print(f"{len(going)} warm start(s), {verb} {freed / BYTES_PER_GIB:.1f} GiB ({warm_dir})")
+    leftovers = clean_sessions(sessions_dir(), dry_run=args.dry_run)
+    if args.dry_run:
+        for leftover in leftovers:
+            size_gib = leftover.size_bytes / BYTES_PER_GIB
+            print(f"delete  {size_gib:5.1f} GiB  left by a session  {leftover.folder}")
+    freed = sum(leftover.size_bytes for leftover in leftovers)
+    print(f"{len(leftovers)} left-over session(s), {verb} {freed / BYTES_PER_GIB:.1f} GiB ({sessions_dir()})")
 
 
 def describe_warm_start(start: WarmStart) -> str:
@@ -204,7 +252,7 @@ async def prepare_warm_start(config: ProjectConfig, vm_dir: Path) -> ProjectBoot
     Raises:
         VMError: If the machine does not boot or a prepare, service or setup step fails.
     """
-    backend = FirecrackerBackend(session_root(), vm_dir)
+    backend = FirecrackerBackend(vm_dir=vm_dir)
     boot = ProjectBoot(backend, config, default_warm_dir())
     try:
         await boot()
@@ -298,6 +346,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    setup_parser = commands.add_parser("setup", help="download and build the VM files (once, 5-10 minutes)")
+    setup_parser.set_defaults(handler=run_setup)
+    doctor_parser = commands.add_parser("doctor", help="check this host runs machines, and boot one")
+    doctor_parser.set_defaults(handler=run_doctor)
+
     build_parser = commands.add_parser("build", help="build the tools drive or an image")
     source = build_parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--tools", action="store_true", help="the tools drive every machine boots")
@@ -311,7 +364,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     images_parser = commands.add_parser("images", help="list built images")
     images_parser.set_defaults(handler=show_images)
 
-    clean_parser = commands.add_parser("clean", help="delete warm starts of gone or unused projects")
+    clean_parser = commands.add_parser(
+        "clean", help="delete warm starts of gone or unused projects, and crashed sessions' files"
+    )
     clean_parser.add_argument(
         "--unused-days", type=float, default=DEFAULT_UNUSED_DAYS, help="also delete those unused this long"
     )
@@ -354,7 +409,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     try:
         args.handler(args)
-    except (ImageError, ConfigError, VMError, ServiceError, CopyError) as error:
+    except (ImageError, ConfigError, VMError, ServiceError, CopyError, SetupError) as error:
         sys.exit(f"chronobox: {error}")
 
 

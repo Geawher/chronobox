@@ -86,42 +86,85 @@ The benchmark is ours, and its tasks are built around hazards like these. Full r
 per-task tables and method:
 [chronobox-ops results](https://github.com/Geawher/chronobox-ops/blob/main/results/README.md).
 
-## Requirements
+## Install
 
-Linux with KVM (read/write access to `/dev/kvm`, e.g. membership of the `kvm`
-group), Python 3.12 with [uv](https://docs.astral.sh/uv/), and Docker to build
-images. No root needed. macOS and Windows are not supported (Firecracker needs
-KVM); a Linux VM with nested virtualization or a remote Linux box works.
+You need **x86_64 Linux with KVM** and **Docker** (to build machine images), and
+[uv](https://docs.astral.sh/uv/). No root. macOS and Windows are not supported (Firecracker needs
+KVM); a Linux VM with nested virtualization, or a remote Linux machine, works.
 
-## Quickstart
+```bash
+uv tool install git+https://github.com/Geawher/chronobox
+chronobox setup     # Firecracker, a guest kernel, the tools drive and the default image (5-10 min, once)
+chronobox doctor    # checks KVM, Docker and the files, then boots a machine
+```
+
+If `doctor` says KVM or Docker is not usable by your user:
+
+```bash
+sudo usermod -aG kvm,docker $USER   # then log out and back in
+```
+
+### Connect your agent
+
+chronobox is an MCP server. In Claude Code, from the folder you work in:
+
+```bash
+claude mcp add chronobox -- chronobox mcp                     # a fresh machine for each session
+claude mcp add chronobox -- chronobox mcp --project .         # your project running on it (below)
+claude mcp add -s user chronobox -- chronobox mcp             # a fresh machine, in every folder
+```
+
+Each session then gets its own machine (boot ≈ 1 s). Any MCP client works the same way: the
+command is `chronobox` with the arguments `mcp` (and `--project /path/to/app`). For example in
+Codex (`~/.codex/config.toml`) or Cursor (`.cursor/mcp.json`):
+
+```toml
+[mcp_servers.chronobox]
+command = "chronobox"
+args = ["mcp", "--project", "/path/to/app"]
+```
+
+```json
+{ "mcpServers": { "chronobox": { "command": "chronobox", "args": ["mcp", "--project", "/path/to/app"] } } }
+```
+
+### Disk use, and uninstalling
+
+| What | Where | Size |
+|---|---|---|
+| VM files: Firecracker, kernel, tools drive, images | `~/.local/share/chronobox/vm` (`CHRONOBOX_VM_DIR`) | about 700 MB, plus each image you build |
+| Warm starts: one per project | `~/.cache/chronobox/warm` | 1-3 GB each |
+| Running sessions' machines and checkpoints | `~/.cache/chronobox/sessions` | deleted when the session ends |
+
+`chronobox clean` deletes the warm starts of projects that are gone or unused for 30 days, and
+what killed or crashed sessions left behind (`--dry-run` lists it all first). To remove
+everything:
+
+```bash
+uv tool uninstall chronobox
+rm -rf ~/.local/share/chronobox ~/.cache/chronobox
+docker image rm chronobox-tools $(docker image ls -q 'chronobox-image-*')
+```
+
+### From a checkout
 
 ```bash
 git clone https://github.com/Geawher/chronobox && cd chronobox
 uv sync
-vm/fetch.sh            # Firecracker + guest kernel into vm/build
-vm/build_rootfs.sh     # the tools drive + the default image (Debian: Python, PostgreSQL, nginx...)
-uv run pytest          # includes real-VM tests
-
-claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp
+uv run chronobox setup        # the same VM files as an installed chronobox
+uv run pytest                 # includes real-VM tests (CHRONOBOX_REQUIRE_VM=1: fail instead of skip)
+claude mcp add chronobox -- uv run --project "$PWD" chronobox mcp
 ```
-
-Each Claude Code session then gets a fresh machine (boot ≈ 1 s). Any MCP client
-works the same way.
-
-The VM files go to `vm/build` of the checkout. To put them elsewhere (or when chronobox
-is installed as a package, e.g. by chronobox-ops), set `CHRONOBOX_VM_DIR` for both the
-build scripts and chronobox; an installed chronobox without it looks in
-`~/.local/share/chronobox/vm`.
 
 ### Your own image
 
 Any Docker image can be the machine's system, from a registry or from your Dockerfile:
 
 ```bash
-uv run chronobox build --image postgres:16                      # -> image "postgres-16"
-uv run chronobox build --dockerfile ./Dockerfile --name myapp   # context: the Dockerfile's folder
-uv run chronobox images
-claude mcp add chronobox -- uv run --project "$PWD" chronobox-mcp --image myapp
+chronobox build --image postgres:16                      # -> image "postgres-16"
+chronobox build --dockerfile ./Dockerfile --name myapp   # context: the Dockerfile's folder
+chronobox images
+claude mcp add chronobox -- chronobox mcp --image myapp
 ```
 
 The image needs nothing from chronobox (no Python, no init): commands run inside it
@@ -164,14 +207,12 @@ env = { POSTGRES_HOST_AUTH_METHOD = "trust" }
 
 ```bash
 cd path/to/app
-chronobox init                     # a starter chronobox.toml (never overwrites one) and AGENTS.md guide
+chronobox init                     # a starter chronobox.toml (never overwrites one), AGENTS.md guide,
+                                   # and .chronobox/ in .gitignore
 chronobox build --project .        # the image it declares, once
 chronobox warm                     # optional: prepare the warm start now, not in the first session
 claude mcp add chronobox -- chronobox mcp --project .
 ```
-
-(`chronobox` here is the installed command; from a checkout, use
-`uv run --project /path/to/chronobox chronobox`.)
 
 - The project is copied to `/src` (`[project] target`), where commands start.
 - Services run under a small restart loop, logs in `/var/log/chronobox/<name>.log`. They start
@@ -267,10 +308,12 @@ chronobox cp main:/src/report.csv ./out         # out (a fork works too: try-1:/
 While `chronobox up` runs, `chronobox mcp --project .` (so every agent session) works on that
 machine instead of starting its own, and keeps it when the session ends.
 
-Options: `--project DIR`, `--no-warm`, `--image NAME` (default `default`),
-`--profile alone|rollback|chronobox` (default `chronobox`), `--guard`, `--no-handoff`,
-`--setup script.sh` (prepare the machine at boot: install, start services, load
-data), `--mem`, `--disk`.
+Options of `chronobox mcp` (all: `chronobox mcp --help`): `--project DIR`, `--no-warm`,
+`--image NAME` (default `default`), `--profile alone|rollback|chronobox` (default `chronobox`),
+`--guard`, `--no-handoff`, `--handoff-dir DIR` (hand-offs without a project), `--setup script.sh`
+(prepare the machine at boot: install, start services, load data), `--mem`, `--disk`,
+`--command-timeout` (seconds, default 300), `--root DIR` (where the session's VMs and checkpoints
+go).
 
 ## Tools
 
@@ -286,7 +329,7 @@ data), `--mem`, `--disk`.
 | `changes(name)` | chronobox | commands, failures and files a fork changed |
 | `promote(name)` / `discard(name, lesson)` | chronobox | keep a fork as main / drop it, with a report |
 | `diff(where)` / `export(path, where)` / `sync(where)` | all, with `--project` | the project's changes as a patch / copy files out / copy local edits in |
-| `verify_script(script, check, ...)` / `verify_result(fork, wait)` | chronobox, with `--project` or `--handoff` | replay a change script on a fresh fork (retries, kills, traffic, the project's checks), then save the hand-off / collect a replay run in the background |
+| `verify_script(script, check, ...)` / `verify_result(fork, wait)` | chronobox, with `--project` or `--handoff-dir` | replay a change script on a fresh fork (retries, kills, traffic, the project's checks), then save the hand-off / collect a replay run in the background |
 
 With `--profile chronobox`, risky commands (deletes, kills, restarts, SQL changes,
 overwrites) are checkpointed automatically first.
@@ -303,7 +346,8 @@ better.
 
 `chronobox-mcp --serve machine.sock` owns the VM and serves it on a unix socket;
 `chronobox-mcp --connect machine.sock` is a thin MCP front end (stdio, or HTTP with
-`--http HOST:PORT`, e.g. for an agent in a container). The machine outlives agent
+`--http HOST:PORT`, e.g. for an agent in a container; the URL's path carries `--http-token`, a
+random one by default, printed at start). The machine outlives agent
 sessions, and harnesses can talk to it directly (`chronobox.request`) — this is how
 the chronobox-ops benchmark measures what agents do.
 
@@ -324,6 +368,23 @@ lazily; checkpoints are files on disk.
 | snapshot (checkpoint / fork point) | 0.3–0.7 s |
 | restore (rollback / fork) | 30–60 ms |
 
+## Security
+
+- **The machine is isolated.** Each one is a Firecracker microVM with no network interface: what
+  runs in it cannot reach your host, your network or the internet. The project is copied in, not
+  mounted; files come out only through `diff`, `export` and hand-offs, into `.chronobox/`.
+- **Commands inside run as root, by design.** Treat the machine as the agent's, not as a sandbox
+  for untrusted code you then trust: a rollback restores it, nothing more.
+- **`chronobox.toml` is code, like a Makefile.** Image builds run the project's Dockerfile with
+  your Docker, and `[handoff] review` runs its command on your host. Use chronobox on repositories
+  you trust.
+- **`--http` serves the machine to whoever has the URL.** Bind it to an address only your agent
+  can reach, and keep the token secret (it is random unless you set one).
+- **The rehearsal guard (`--guard`) is a safety net for mistakes**, a heuristic over command text,
+  not a security boundary.
+
+Report a vulnerability privately: see [SECURITY.md](SECURITY.md).
+
 ## Limits
 
 - Linux + KVM only; VMs have no network (everything a task needs runs inside).
@@ -336,11 +397,11 @@ lazily; checkpoints are files on disk.
 ```
 src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints, forks,
                  reports, lessons, guard) · commands.py · service.py · server.py (MCP)
-                 images.py · cli.py (`chronobox build`, `images`, `init`, `guide`, `warm`, `up`, `cp`,
-                 `down`, `mcp`) · config.py (chronobox.toml) · project.py (bring a project up, warm
+                 images.py · install.py (`chronobox setup`, `doctor`) · cli.py (`chronobox build`,
+                 `images`, `init`, `guide`, `warm`, `clean`, `up`, `cp`, `down`, `mcp`) · config.py (chronobox.toml) · project.py (bring a project up, warm
                  start, diff, export, sync) · handoff.py (`verify_script`) · guide.py (AGENTS.md)
                  · copying.py (`chronobox cp`)
-vm/              tools/ (tools drive: init, guest agent) · images/default/ · fetch.sh · build_rootfs.sh
+vm/              tools/ (tools drive: init, guest agent) · images/default/ (the default image)
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
 examples/notes/  a web app + PostgreSQL project with its chronobox.toml
 ```

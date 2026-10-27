@@ -35,7 +35,7 @@ from pathlib import Path, PurePosixPath
 from chronobox.config import ProjectConfig, Service
 from chronobox.images import TOOLS_DISK, image_disk
 from chronobox.service import Method
-from chronobox.vm import FirecrackerBackend, Machine, MachineSpec, VMError, try_lock_saved
+from chronobox.vm import FirecrackerBackend, Machine, MachineSpec, VMError, cache_dir, try_lock_saved
 from chronobox.workspace import MAIN, Booted, Workspace
 
 log = logging.getLogger(__name__)
@@ -75,20 +75,9 @@ class ProjectError(Exception):
     """A diff or export that cannot be done as asked; the message is for the agent."""
 
 
-def cache_dir() -> Path:
-    """``$XDG_CACHE_HOME/chronobox`` (``~/.cache/chronobox``)."""
-    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "chronobox"
-
-
 def default_warm_dir() -> Path:
     """``<cache>/warm``: each warm snapshot is in ``<project id>/<warm key>`` under it."""
     return cache_dir() / "warm"
-
-
-def session_root() -> Path:
-    """A new folder for one session's VMs and snapshots, outside the project (the backend
-    deletes it when it cleans up)."""
-    return cache_dir() / "sessions" / uuid.uuid4().hex[:10]
 
 
 def project_id(config: ProjectConfig) -> str:
@@ -624,7 +613,7 @@ def project_note(config: ProjectConfig, *, with_handoff: bool = False) -> str:
 
 
 # Which way to work is the user's request, not the tools: agents given `verify_script` used it even
-# when asked to change the machine itself (E40: 27 of 30 Sonnet runs).
+# when asked to change the machine itself (27 of 30 Sonnet runs in our tests).
 CHANGE_OR_HANDOFF = (
     "The user's request decides how you deliver. Asked to make a change (on this machine, the "
     "server, production): make it on main, rehearsing what you are unsure of on a fork first, and do "
