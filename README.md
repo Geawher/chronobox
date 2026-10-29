@@ -162,6 +162,11 @@ the internet. Commands inside run as root, and a `chronobox.toml` is code, like 
 chronobox on repositories you trust. Details: [docs/security.md](docs/security.md). Report a
 vulnerability privately: [SECURITY.md](SECURITY.md).
 
+## Contributing
+
+Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) for the setup and the
+checks, and [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
+
 ## License
 
 Apache-2.0, see [LICENSE](LICENSE).

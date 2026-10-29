@@ -34,6 +34,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
+import chronobox
 from chronobox.config import ConfigError, ProjectConfig, load_config
 from chronobox.handoff import handoff_tools
 from chronobox.images import DEFAULT_IMAGE
@@ -409,6 +410,7 @@ def _stop_now(backend: FirecrackerBackend, signum: int) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse ``chronobox-mcp`` options; ``--http`` needs ``--connect``, ``--setup`` excludes ``--project``."""
     parser = argparse.ArgumentParser(prog="chronobox-mcp", description=__doc__.splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"%(prog)s {chronobox.__version__}")
     parser.add_argument("--profile", type=Profile, choices=list(Profile), default=Profile.CHRONOBOX)
     parser.add_argument(
         "--guard", action="store_true", help="refuse unrehearsed destructive commands on main"
