@@ -12,4 +12,3 @@ pages go further.
 | [Does chronobox help?](results.md) | read the benchmark results in full, and where chronobox does not help |
 | [How it works](how-it-works.md) | understand the microVMs and snapshots, long-lived machines, limits and the code layout |
 | [Security](security.md) | know what is isolated and what is not |
-| [The demo](demo/README.md) | re-record the README's GIF |

@@ -12,10 +12,10 @@ Fork the live server, try the fix on the copy, and apply it for real once it wor
   <img src="https://img.shields.io/badge/platform-x86__64%20Linux%20%2B%20KVM-lightgrey" alt="x86_64 Linux with KVM">
 </p>
 
-<p align="center"><img src="docs/demo.gif" width="864" alt="Claude Code adds a required column to a live notes database: it forks the machine, rehearses a migration on the copy while users keep writing, then applies it to the real machine; every note users saved is kept."></p>
+<p align="center"><img src="docs/demo.gif" width="864" alt="Claude Code adds a required title column to a live notes database: it forks the machine, rehearses the migration and the app change on the copy while users keep writing, then applies them to the real machine; no saved note is lost."></p>
 
-<p align="center"><sub>A real Claude Code session (Sonnet 5.5, 39 s) on <a href="examples/notes">examples/notes</a> while users keep writing notes, shortened to fit.
-<a href="docs/demo">Recorded with docs/demo/record.sh</a>.</sub></p>
+<p align="center"><sub>A real Claude Code session (Sonnet 5.5) on <a href="examples/notes">examples/notes</a> while users keep writing notes,
+recorded in a terminal; pauses cut to 2 s, played at 1.5x.</sub></p>
 
 ## Why
 

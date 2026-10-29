@@ -1,1 +1,0 @@
-Notes need a title. Add a required title column to the notes table on the running server, filled for the existing notes from the first three words of their body, and return it in GET /notes. Users are writing notes right now: keep the app working for them.
