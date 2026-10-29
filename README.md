@@ -15,7 +15,7 @@ Fork the live server, try the fix on the copy, and apply it for real once it wor
 <p align="center"><img src="docs/demo.gif" width="864" alt="Claude Code adds a required title column to a live notes database: it forks the machine, rehearses the migration and the app change on the copy while users keep writing, then applies them to the real machine; no saved note is lost."></p>
 
 <p align="center"><sub>A real Claude Code session (Sonnet 5.5) on <a href="examples/notes">examples/notes</a> while users keep writing notes,
-recorded in a terminal; pauses cut to 2 s, played at 1.5x. <a href="docs/demo">How it was recorded</a>.</sub></p>
+recorded in a terminal; pauses cut to 2 s, played at 1.5x.</sub></p>
 
 ## Why
 

@@ -46,5 +46,5 @@ src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints,
 vm/              tools/ (tools drive: init, guest agent) · images/default/ (the default image)
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
 examples/notes/  a web app + PostgreSQL project with its chronobox.toml
-docs/            these pages, the logo and the demo
+docs/            these pages, the logo and the demo GIF
 ```
