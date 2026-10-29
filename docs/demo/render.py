@@ -1,173 +1,162 @@
-"""Render a recorded Claude Code session (record.sh's session.jsonl) as the README's demo GIF.
+"""Render an asciinema recording (record.sh's demo.cast) as the README's demo GIF.
 
-Every tool call and agent message of the session is shown in order, shortened to fit: long
-commands and outputs keep their first lines. Reading files is collapsed into one line.
+The recording is replayed through a terminal emulator (pyte), sampled 10 times a second; each
+screen that changed becomes a frame, held as long as it was on screen (the recording already cut
+pauses to 2 s).
 
-    uv run --with pillow python docs/demo/render.py docs/demo/session.jsonl docs/demo.gif
+    uv run --with pillow --with pyte --with fonttools \
+      python docs/demo/render.py docs/demo/demo.cast docs/demo.gif [--start S] [--end S] [--speed X]
 """
 
 from __future__ import annotations
 
-import contextlib
+import argparse
 import json
 import re
-import sys
-import textwrap
-from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
+import pyte
+from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
 
-COLUMNS = 92
-ROWS = 24
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
+FONTS = "/usr/share/fonts/truetype"
+FONT = f"{FONTS}/dejavu/DejaVuSansMono.ttf"
+FONT_BOLD = f"{FONTS}/dejavu/DejaVuSansMono-Bold.ttf"
+# Glyphs DejaVu Sans Mono lacks (Claude Code's ⏺, ✻, ⎿...) come from these, in order.
+FALLBACKS = (f"{FONTS}/noto/NotoSansSymbols2-Regular.ttf", f"{FONTS}/noto/NotoSansSymbols-Regular.ttf",
+             f"{FONTS}/noto/NotoSansMath-Regular.ttf")  # fmt: skip
 FONT_SIZE = 15
-CELL_W, CELL_H = 9, 20
-PAD = 18
-BAR = 30
-COLORS = {
-    "bg": (15, 23, 38),
-    "bar": (23, 35, 56),
-    "text": (232, 237, 245),
-    "dim": (139, 150, 170),
-    "call": (242, 169, 59),
-    "fork": (43, 179, 163),
-    "ok": (120, 200, 140),
-    "user": (170, 190, 255),
-}
-TYPE_FRAME_MS = 40
-CHARS_PER_FRAME = 6
-COMMAND_LINES = 4
-RESULT_LINES = 3
-HIDDEN_TOOLS = {"ToolSearch", "Glob"}
-SESSION_TOOL = "mcp__chronobox__"
+CELL_W, CELL_H = 9, 19
+PAD = 14
+BACKGROUND = (15, 23, 38)
+FOREGROUND = (232, 237, 245)
+# The 16 named colours, as pyte names them.
+NAMED = {
+    "black": (40, 44, 52), "red": (232, 128, 90), "green": (120, 200, 140), "brown": (242, 169, 59),
+    "yellow": (242, 169, 59), "blue": (110, 150, 240), "magenta": (200, 140, 230), "cyan": (43, 179, 163),
+    "white": (220, 225, 235), "brightblack": (139, 150, 170), "brightred": (240, 150, 120),
+    "brightgreen": (150, 220, 160), "brightbrown": (250, 200, 110), "brightyellow": (250, 200, 110),
+    "brightblue": (150, 180, 250), "brightmagenta": (220, 170, 240), "brightcyan": (90, 210, 195),
+    "brightwhite": (250, 250, 252),
+}  # fmt: skip
+FRAME_S = 0.1  # the screen is sampled 10 times a second; unchanged samples extend the frame before
+LAST_FRAME_MS = 6000
+INFINITY = float("inf")
+# Terminal graphics commands (Claude Code's logo in terminals that draw images): pyte prints them.
+GRAPHICS_START = "\x1b_"
+GRAPHICS = re.compile(r"\x1b_.*?\x1b\\", re.DOTALL)
 
 
-@dataclass
-class Line:
-    """One terminal row: its text, colour, and whether it is typed out or appears at once."""
-
-    text: str
-    color: str = "text"
-    typed: bool = False
-    bold: bool = False
-
-
-def wrap(text: str, indent: str = "  ", limit: int | None = None) -> list[str]:
-    """Wrap ``text`` to the terminal, ``indent`` before its first row and spaces before the others;
-    keep the first ``limit`` rows."""
-    rows: list[str] = []
-    for raw in text.splitlines() or [""]:
-        rows += textwrap.wrap(raw, COLUMNS - len(indent), replace_whitespace=False) or [""]
-    if limit is not None and len(rows) > limit:
-        rows = rows[:limit] + ["…"]
-    return [(indent if index == 0 else " " * len(indent)) + row for index, row in enumerate(rows)]
+def color(name: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    """An RGB colour from pyte's name for it: a named colour, a 6-digit hex value, or the default."""
+    if name in NAMED:
+        return NAMED[name]
+    if len(name) == 6:
+        try:
+            return int(name[0:2], 16), int(name[2:4], 16), int(name[4:6], 16)
+        except ValueError:
+            pass
+    return default
 
 
-def result_text(content: object) -> str:
-    """The text of a tool result, without the JSON wrapper chronobox's tools reply in."""
-    if isinstance(content, list):
-        content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
-    text = str(content)
-    with contextlib.suppress(ValueError, KeyError, TypeError):
-        text = json.loads(text)["result"]
-    return re.sub(r"\n\[exit code 0\]$", "", text.strip())
+@cache
+def characters(path: str) -> frozenset[int]:
+    """The code points a font file has glyphs for."""
+    return frozenset(TTFont(path).getBestCmap())
 
 
-def call_lines(name: str, arguments: dict) -> list[Line]:
-    """The lines announcing one tool call."""
-    if name.startswith(SESSION_TOOL):
-        tool = name.removeprefix(SESSION_TOOL)
-        where = arguments.get("where") or arguments.get("name") or ""
-        head = f"● chronobox.{tool}" + (f" [{where}]" if where else "")
-        color = "fork" if tool in {"fork", "discard", "promote"} or where not in {"", "main"} else "call"
-        body = arguments.get("command") or arguments.get("lesson") or ""
-        prefix = "  $ " if "command" in arguments else "  "
-        rows = wrap(body, prefix, COMMAND_LINES) if body else []
-        return [Line(head, color, typed=True, bold=True)] + [Line(row, "text", typed=True) for row in rows]
-    target = arguments.get("file_path", "")
-    return [Line(f"● {name} {Path(target).name}", "call", typed=True, bold=True)]
+@cache
+def font_for(char: str, bold: bool) -> ImageFont.FreeTypeFont:
+    """DejaVu Sans Mono (bold or not) if it has ``char``, else the first fallback that has it."""
+    path = next((path for path in (FONT, *FALLBACKS) if ord(char) in characters(path)), FONT)
+    return ImageFont.truetype(FONT_BOLD if bold and path == FONT else path, FONT_SIZE)
 
 
-def session_lines(path: Path) -> list[Line]:
-    """Every line of the demo, in the order the session produced them."""
-    events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    lines: list[Line] = []
-    reads: list[str] = []
-    calls: dict[str, str] = {}
-    for event in events:
-        if event.get("type") == "system" and event.get("subtype") == "init":
-            prompt = (path.parent / "prompt.txt").read_text().strip()
-            lines += [Line("$ claude", "dim")] + [Line(row, "user", typed=True) for row in wrap(prompt, "> ")]
-            lines.append(Line(""))
-        for part in event.get("message", {}).get("content", []) if event.get("type") == "assistant" else []:
-            if part["type"] == "text" and event is not events[-2]:
-                first = re.split(r"(?<=[.:])\s", part["text"].strip(), maxsplit=1)[0]
-                lines += [Line(row, "dim", typed=True) for row in wrap(first, "  ")]
-            elif part["type"] == "tool_use":
-                calls[part["id"]] = part["name"]
-                if part["name"] in HIDDEN_TOOLS:
-                    continue
-                if part["name"] == "Read":
-                    reads.append(Path(part["input"]["file_path"]).name)
-                    continue
-                if reads:
-                    lines.append(Line("● Read " + ", ".join(reads), "call", typed=True, bold=True))
-                    reads = []
-                lines += call_lines(part["name"], part["input"])
-        for part in event.get("message", {}).get("content", []) if event.get("type") == "user" else []:
-            if not isinstance(part, dict) or part.get("type") != "tool_result":
-                continue
-            if not calls.get(part["tool_use_id"], "").startswith(SESSION_TOOL):
-                continue
-            text = result_text(part["content"])
-            for row in wrap(text, "  → ", RESULT_LINES):
-                color = "ok" if "checkpoint" in row or "copy of the machine" in row else "dim"
-                lines.append(Line(row, color))
-        if event.get("type") == "result":
-            lines.append(Line(""))
-            summary = event["result"].strip().split("\n\n")[0].replace("`", "")
-            lines += [Line(row, "text", bold=True) for row in wrap("✓ " + summary, "")]
-    return lines
+def draw(screen: pyte.Screen) -> Image.Image:
+    """The screen as an image."""
+    image = Image.new("RGB", (PAD * 2 + screen.columns * CELL_W, PAD * 2 + screen.lines * CELL_H), BACKGROUND)
+    pen = ImageDraw.Draw(image)
+    for row in range(screen.lines):
+        line = screen.buffer[row]
+        for column in range(screen.columns):
+            cell = line[column]
+            fg, bg = color(cell.fg, FOREGROUND), color(cell.bg, BACKGROUND)
+            if cell.reverse:
+                fg, bg = bg, fg
+            x, y = PAD + column * CELL_W, PAD + row * CELL_H
+            if bg != BACKGROUND:
+                pen.rectangle((x, y, x + CELL_W - 1, y + CELL_H - 1), fill=bg)
+            if cell.data.strip():
+                pen.text((x, y + 1), cell.data, fill=fg, font=font_for(cell.data, cell.bold))
+    return image
 
 
-def draw(lines: list[Line], fonts: tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]) -> Image.Image:
-    """One frame: the last ``ROWS`` lines in a terminal window."""
-    width, height = PAD * 2 + COLUMNS * CELL_W, BAR + PAD * 2 + ROWS * CELL_H
-    frame = Image.new("RGB", (width, height), COLORS["bg"])
-    pen = ImageDraw.Draw(frame)
-    pen.rectangle((0, 0, width, BAR), fill=COLORS["bar"])
-    for index, color in enumerate(((232, 128, 90), (242, 169, 59), (43, 179, 163))):
-        pen.ellipse((14 + index * 20, 10, 24 + index * 20, 20), fill=color)
-    pen.text((width // 2, BAR // 2), "claude · chronobox", fill=COLORS["dim"], font=fonts[0], anchor="mm")
-    for row, line in enumerate(lines[-ROWS:]):
-        font = fonts[1] if line.bold else fonts[0]
-        pen.text((PAD, BAR + PAD + row * CELL_H), line.text[:COLUMNS], fill=COLORS[line.color], font=font)
-    return frame
-
-
-def render(session: Path, target: Path) -> None:
-    """Type the session out line by line and save the frames as a looping GIF."""
-    fonts = (ImageFont.truetype(FONT, FONT_SIZE), ImageFont.truetype(FONT_BOLD, FONT_SIZE))
+def render(
+    cast: Path, target: Path, start: float = 0.0, end: float = float("inf"), speed: float = 1.0
+) -> None:
+    """Replay ``cast`` and save each screen it showed between ``start`` and ``end`` (seconds into the
+    recording) as a frame of a looping GIF, played ``speed`` times faster."""
+    lines = cast.read_text().splitlines()
+    header = json.loads(lines[0])
+    screen = pyte.Screen(header["width"], header["height"])
+    stream = pyte.Stream(screen)
+    screen.dirty.clear()
     frames: list[Image.Image] = []
-    durations: list[int] = []
-    shown: list[Line] = []
-    for line in session_lines(session):
-        if line.typed and len(line.text) > CHARS_PER_FRAME:
-            for end in range(CHARS_PER_FRAME, len(line.text), CHARS_PER_FRAME * 3):
-                frames.append(draw([*shown, Line(line.text[:end], line.color, bold=line.bold)], fonts))
-                durations.append(TYPE_FRAME_MS)
-        shown.append(line)
-        frames.append(draw(shown, fonts))
-        durations.append(900 if line.text.startswith("●") else 160 if line.typed else 300)
-    durations[-1] = 8000
-    palette = frames[-1].quantize(colors=32)
+    starts: list[float] = []
+    tick = 0.0
+    pending = ""
+    for line in lines[1:]:
+        at, kind, data = json.loads(line)
+        if kind != "o":
+            continue
+        while tick <= min(at, end):  # the screen at each tick, when it changed since the last frame
+            shows_something = frames or any(row.strip() for row in screen.display)  # no blank opening
+            if start <= tick and shows_something and (screen.dirty or not frames):
+                frames.append(draw(screen))
+                starts.append(tick)
+                screen.dirty.clear()
+            tick += FRAME_S
+        if at > end:
+            break
+        data, pending = without_graphics(pending + data)
+        stream.feed(data)
+    else:
+        frames.append(draw(screen))
+        starts.append(tick)
+    ends = [*starts[1:], starts[-1] + LAST_FRAME_MS / 1000 * speed]
+    durations = [round((stop - begin) * 1000 / speed) for begin, stop in zip(starts, ends, strict=True)]
+    durations[-1] = LAST_FRAME_MS
+    palette = frames[-1].quantize(colors=64)
     frames = [frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in frames]
     frames[0].save(target, save_all=True, append_images=frames[1:], duration=durations, loop=0, optimize=True)
     size_kib = target.stat().st_size // 1024
     print(f"{target}: {len(frames)} frames, {sum(durations) / 1000:.0f} s, {size_kib} KiB")
 
 
+def without_graphics(data: str) -> tuple[str, str]:
+    """``data`` without terminal graphics commands (``ESC _ ... ESC \\``, which pyte would print as
+    text), and an unfinished one at its end, kept for the next chunk."""
+    data = GRAPHICS.sub("", data)
+    unfinished = data.rfind(GRAPHICS_START)
+    if unfinished == -1:
+        return data, ""
+    return data[:unfinished], data[unfinished:]
+
+
+def main() -> None:
+    """Parse the command line and render."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("cast", type=Path)
+    parser.add_argument("gif", type=Path)
+    parser.add_argument("--start", type=float, default=0.0, help="seconds into the recording to start at")
+    parser.add_argument(
+        "--end", type=float, default=float("inf"), help="seconds into the recording to end at"
+    )
+    parser.add_argument("--speed", type=float, default=1.0, help="play this many times faster")
+    args = parser.parse_args()
+    render(args.cast, args.gif, args.start, args.end, args.speed)
+
+
 if __name__ == "__main__":
-    render(Path(sys.argv[1]), Path(sys.argv[2]))
+    main()

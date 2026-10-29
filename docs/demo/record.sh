@@ -1,12 +1,22 @@
 #!/bin/sh
-# Record the README's demo: a real Claude Code session on examples/notes while users keep writing
-# notes, saved as session.jsonl (Claude Code's stream-json). render.py turns it into demo.gif.
+# Record the README's demo as a real terminal session: interactive Claude Code on examples/notes
+# while users keep writing notes. render.py turns the recording into demo.gif.
 #
-#   CLAUDE_CODE_OAUTH_TOKEN=... docs/demo/record.sh [model]
+#   docs/demo/record.sh [folder]     (default: ~/Desktop/notes-demo, must not exist)
+#
+# Claude Code starts with the prompt already sent; when it is done, type /exit to stop recording.
+# Set CHRONOBOX_VM_DIR to use VM files other than `chronobox setup`'s, and CLAUDE_CODE_OAUTH_TOKEN
+# (from `claude setup-token`) to record with another account than the one you are logged in with:
+# Claude Code shows the account's plan in its header.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
-work=$(mktemp -d)
+work=${1:-$HOME/Desktop/notes-demo}
+if [ -e "$work" ]; then
+  echo "$work exists: remove it or pass another folder" >&2
+  exit 1
+fi
+mkdir -p "$work"
 cp -r "$repo/examples/notes/." "$work/"
 cat >> "$work/chronobox.toml" <<'TOML'
 
@@ -17,28 +27,22 @@ start = "python3 traffic.py"
 ready = "test -s /tmp/traffic-saved"
 after_setup = true
 TOML
+env=""
+[ -n "$CHRONOBOX_VM_DIR" ] && env=", \"env\": {\"CHRONOBOX_VM_DIR\": \"$CHRONOBOX_VM_DIR\"}"
 cat > "$work/mcp.json" <<JSON
-{"mcpServers": {"chronobox": {"command": "uv", "args": ["run", "--project", "$repo", "chronobox", "mcp", "--project", "$work"]}}}
+{"mcpServers": {"chronobox": {"command": "uv", "args": ["run", "--project", "$repo", "chronobox", "mcp", "--project", "$work"]$env}}}
 JSON
+# Warm the machine first, so the recording does not open on a minute of booting.
+uv run --project "$repo" chronobox warm --project "$work"
 cd "$work"
-claude -p "$(cat "$here/prompt.txt")" \
-  --model "${1:-claude-sonnet-5-5}" \
-  --mcp-config mcp.json --strict-mcp-config \
-  --allowedTools "mcp__chronobox" Read Edit Write Glob Grep \
-  --output-format stream-json --verbose > "$work/raw.jsonl"
-# Keep what the demo shows: the model and version, then the messages (the full init event also
-# lists this machine's own plugins, skills and paths).
-python3 - "$work/raw.jsonl" > "$here/session.jsonl" <<'PY'
-import json, sys
-for line in open(sys.argv[1]):
-    event = json.loads(line)
-    if event.get("type") == "system" and event.get("subtype") == "init":
-        event = {key: event[key] for key in ("type", "subtype", "model", "claude_code_version")}
-    elif event.get("type") not in ("assistant", "user", "result"):
-        continue
-    elif event["type"] == "assistant":
-        parts = event["message"]["content"]
-        event["message"]["content"] = [part for part in parts if part.get("type") != "thinking"]
-    print(json.dumps(event))
-PY
-echo "recorded $here/session.jsonl (project copy: $work)"
+prompt=$(cat "$here/prompt.txt")
+# No user settings (plugins, hooks, CLAUDE.md): what anyone gets with a fresh install; --verbose
+# shows each tool call instead of folding them. Pauses longer than 2 s (the model thinking) are
+# cut to 2 s.
+asciinema rec "$here/demo.cast" --overwrite --idle-time-limit 2 --cols 110 --rows 32 \
+  --title "Claude Code with chronobox" \
+  --command "claude --model ${MODEL:-claude-sonnet-5-5} --setting-sources '' --verbose \
+    --mcp-config mcp.json --strict-mcp-config \
+    --allowedTools mcp__chronobox Read Edit Write Glob Grep -- '$prompt'"
+echo "recorded $here/demo.cast; render it with (--start/--end in seconds cut the recording):"
+echo "  uv run --with pillow --with pyte --with fonttools python $here/render.py $here/demo.cast $repo/docs/demo.gif --speed 1.5"
