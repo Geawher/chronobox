@@ -17,7 +17,7 @@ def write(folder: Path, text: str) -> Path:
 
 
 def test_the_example_project_reads_as_written() -> None:
-    """The README's example project parses to the services, setup and excludes it declares."""
+    """The example project parses to the services, setup and excludes it declares."""
     config = load_config(EXAMPLE)
     assert config.path == EXAMPLE
     assert (config.image.name, config.target) == ("default", "/src")
