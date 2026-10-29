@@ -36,4 +36,4 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-markers = ["vm: needs /dev/kvm and a built VM image (vm/fetch.sh, vm/build_rootfs.sh)"]
+markers = ["vm: needs /dev/kvm and the VM files (`chronobox setup`)"]

@@ -133,8 +133,8 @@ SAMPLE_CAVEAT = "the logic was checked, not the time or locks at full size"
 # A failed replay whose script ran this long gets a hint to check the logic on a sample first.
 SLOW_REPLAY_S = 120.0
 # A reviewer (``[handoff] review``) gets this long to answer; its first line is OK when it sees no gap.
-# The prompt asks for likely gaps only: in an offline test on 274 verified hand-offs (RESEARCH_LOG
-# E39), asking for any gap made every reviewer flag nearly every hand-off, which told agents nothing.
+# The prompt asks for likely gaps only: in an offline test on 274 verified hand-offs, asking for
+# any gap made every reviewer flag nearly every hand-off, which told agents nothing.
 REVIEW_TIMEOUT_S = 300.0
 REVIEW_OK = "OK"
 REVIEW_PROMPT = """You review a change script before it runs on a production machine. \

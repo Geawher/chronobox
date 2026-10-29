@@ -15,6 +15,7 @@ interface; everything runs inside the VM (loopback works).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ctypes
 import errno
 import fcntl
@@ -22,6 +23,7 @@ import itertools
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -56,6 +58,10 @@ GUEST_REPLY_MARGIN_S = 30.0
 GUEST_REPLY_LIMIT = 2**26  # one JSON line holds the whole output; callers shorten it
 TRANSFER_TIMEOUT_S = 300.0
 READY_TIMEOUT_S = 30.0
+# A session folder without a lock (made by chronobox 0.1) counts as left over after this long.
+UNLOCKED_SESSION_AGE_S = 86400
+# A session folder this young may belong to a backend between creating its lock file and taking it.
+NEW_SESSION_GRACE_S = 60
 BYTES_PER_MIB = 1024 * 1024
 API_SOCKET_WAIT_S = 2.0
 CONTENT_LENGTH = "content-length"
@@ -82,6 +88,88 @@ def default_vm_dir() -> Path:
         return checkout
     data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     return data_home / "chronobox" / "vm"
+
+
+def cache_dir() -> Path:
+    """``$XDG_CACHE_HOME/chronobox`` (``~/.cache/chronobox``)."""
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "chronobox"
+
+
+def sessions_dir() -> Path:
+    """``<cache>/sessions``: one folder per backend, for its VMs and snapshots."""
+    return cache_dir() / "sessions"
+
+
+def session_root() -> Path:
+    """A new folder for one session's VMs and snapshots, outside the folder chronobox runs from
+    (the backend deletes it when it cleans up)."""
+    return sessions_dir() / uuid.uuid4().hex[:10]
+
+
+@dataclass(frozen=True)
+class LeftoverSession:
+    """The VMs and snapshots of a session that ended without cleaning up (killed, or crashed).
+
+    Attributes:
+        folder: The session's folder.
+        size_bytes: Disk space it takes (blocks in use: its disks are sparse).
+    """
+
+    folder: Path
+    size_bytes: int
+
+
+def clean_sessions(directory: Path, *, dry_run: bool = False) -> list[LeftoverSession]:
+    """Delete the session folders no running backend holds, and return them.
+
+    A backend holds its folder's lock while it runs, so a free lock means its process is gone.
+    Folders without a lock come from older versions and count as left over once unchanged for
+    ``UNLOCKED_SESSION_AGE_S``. With ``dry_run`` nothing is deleted.
+    """
+    leftovers = []
+    for folder in sorted(directory.iterdir()) if directory.is_dir() else ():
+        # A session that ends meanwhile deletes its own folder: skip it.
+        with contextlib.suppress(FileNotFoundError):
+            if not folder.is_dir():
+                continue
+            lock = _free_session_lock(folder)
+            if lock is None:
+                continue
+            with lock or contextlib.nullcontext():
+                leftovers.append(LeftoverSession(folder, freed_bytes(folder)))
+                if not dry_run:
+                    shutil.rmtree(folder, ignore_errors=True)
+    return leftovers
+
+
+def freed_bytes(folder: Path) -> int:
+    """The disk space deleting ``folder`` frees: blocks in use of each file once, leaving out files
+    also linked from outside it (a machine's image disk, a hard link to the VM files)."""
+    links: dict[tuple[int, int], list[os.stat_result]] = {}
+    for path in folder.rglob("*"):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            links.setdefault((info.st_dev, info.st_ino), []).append(info)
+    return sum(found[0].st_blocks * 512 for found in links.values() if len(found) == found[0].st_nlink)
+
+
+def _free_session_lock(folder: Path) -> TextIO | bool | None:
+    """The session's lock if no backend holds it; ``False`` for an old unlocked folder left
+    long enough; ``None`` if the folder may still be in use (or is too new to tell).
+
+    Raises:
+        FileNotFoundError: If the folder disappears meanwhile.
+    """
+    lock_file = folder / IN_USE_LOCK
+    if not lock_file.exists():
+        newest = max(entry.lstat().st_mtime for entry in [folder, *folder.rglob("*")])
+        return False if time.time() - newest > UNLOCKED_SESSION_AGE_S else None
+    if time.time() - lock_file.stat().st_mtime < NEW_SESSION_GRACE_S:
+        return None
+    return try_lock_saved(folder)
 
 
 @dataclass(frozen=True)
@@ -252,7 +340,8 @@ class FirecrackerBackend:
 
     def __init__(self, root: Path | None = None, vm_dir: Path | None = None) -> None:
         """Use the VM files in ``vm_dir`` (default: ``default_vm_dir()``) and keep machines and
-        snapshots under ``root`` (default: a new folder under ``runs/vms``).
+        snapshots under ``root`` (default: a new session folder, ``session_root()``), locked while
+        this backend runs.
 
         Raises:
             VMError: If Firecracker, the kernel or the tools drive is missing.
@@ -260,10 +349,17 @@ class FirecrackerBackend:
         self.vm_dir = vm_dir or default_vm_dir()
         missing = [name for name in VM_FILES if not (self.vm_dir / name).exists()]
         if missing:
-            raise VMError(f"missing {missing} in {self.vm_dir}; run vm/fetch.sh and vm/build_rootfs.sh")
-        self.root = (root or Path("runs/vms") / uuid.uuid4().hex[:10]).resolve()
+            raise VMError(f"missing {', '.join(missing)} in {self.vm_dir}; run `chronobox setup`")
+        self.root = (root or session_root()).resolve()
         (self.root / "vms").mkdir(parents=True, exist_ok=True)
         (self.root / "snapshots").mkdir(parents=True, exist_ok=True)
+        # Held until cleanup: `chronobox clean` deletes only session folders whose lock is free.
+        self._lock = (self.root / IN_USE_LOCK).open("a")
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._lock.close()
+            raise VMError(f"{self.root} is in use by another chronobox session") from None
         self.stats = BackendStats()
         self._ids = itertools.count()
         self._specs: dict[str, MachineSpec] = {}
@@ -405,6 +501,7 @@ class FirecrackerBackend:
             lock.close()
         self._borrowed.clear()
         shutil.rmtree(self.root, ignore_errors=True)
+        self._lock.close()
 
     async def _close(self, machine: Machine) -> None:
         """Stop tracking a machine and close it."""

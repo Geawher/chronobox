@@ -14,12 +14,14 @@ def _vm_available() -> bool:
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Skip every test marked ``vm`` when no VM can run here, with what to build."""
+    """Skip every test marked ``vm`` when no VM can run here, with what to build (or stop, when
+    ``CHRONOBOX_REQUIRE_VM`` says they must run)."""
     if _vm_available():
         return
-    skip = pytest.mark.skip(
-        reason="needs /dev/kvm, the tools drive and the default image (vm/fetch.sh, vm/build_rootfs.sh)"
-    )
+    reason = "needs /dev/kvm and the VM files (`chronobox setup`; `chronobox doctor` says what is missing)"
+    if os.environ.get("CHRONOBOX_REQUIRE_VM"):
+        raise pytest.UsageError(f"CHRONOBOX_REQUIRE_VM is set, but the real-VM tests cannot run: {reason}")
+    skip = pytest.mark.skip(reason=reason)
     for item in items:
         if "vm" in item.keywords:
             item.add_marker(skip)

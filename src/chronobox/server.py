@@ -22,6 +22,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
+import secrets
+import shutil
+import signal
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -39,13 +43,16 @@ from chronobox.project import (
     default_warm_dir,
     project_note,
     project_tools,
-    session_root,
     up_socket,
 )
 from chronobox.project import machine_spec as project_machine_spec
 from chronobox.service import WorkspaceService, call_remote, is_serving
-from chronobox.vm import FirecrackerBackend, MachineSpec
+from chronobox.vm import FirecrackerBackend, MachineSpec, VMError
 from chronobox.workspace import MAIN, Profile, Workspace
+
+# MCP clients stop a server with one of these (after closing its stdin, or instead of it).
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+EXIT_ON_SIGNAL = 128
 
 INSTRUCTIONS = {
     Profile.ALONE: (
@@ -342,6 +349,9 @@ async def run_connected(args: argparse.Namespace) -> None:
         await server.run_stdio_async()
         return
     host, port = args.http.rsplit(":", 1)
+    if args.http_token is None:
+        args.http_token = secrets.token_urlsafe(16)
+        print(f"chronobox-mcp: serving MCP at http://{args.http}/mcp/{args.http_token}", file=sys.stderr)
     await server.run_streamable_http_async(
         host=host,
         port=int(port),
@@ -358,8 +368,10 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
     The boot runs in the background, so the server answers at once; tool calls wait for it.
     """
     project = load_project(args)
-    # A project's server runs from the project's folder: keep its VMs out of it.
-    backend = FirecrackerBackend(args.root or (session_root() if project else None))
+    backend = FirecrackerBackend(args.root)
+    loop = asyncio.get_running_loop()
+    for stop in STOP_SIGNALS:
+        loop.add_signal_handler(stop, _stop_now, backend, stop)
     if project is None:
         workspace = Workspace(backend, machine_spec(args), profile=args.profile, guard=args.guard)
         service = WorkspaceService(workspace)
@@ -377,9 +389,21 @@ async def _owned_service(args: argparse.Namespace):  # type: ignore[no-untyped-d
     try:
         yield service
     finally:
+        for stop in STOP_SIGNALS:
+            loop.remove_signal_handler(stop)
         booting.cancel()
         await workspace.close()
         await backend.cleanup()
+
+
+def _stop_now(backend: FirecrackerBackend, signum: int) -> None:
+    """Delete the session's VMs and checkpoints, then exit at once.
+
+    A stdio server waits on stdin in a thread, so a cancelled server would not stop until the client
+    killed it, leaving gigabytes of VM files behind. Firecracker processes die with this one.
+    """
+    shutil.rmtree(backend.root, ignore_errors=True)
+    os._exit(EXIT_ON_SIGNAL + signum)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -393,7 +417,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--serve", type=Path, metavar="SOCKET", help="own the VM and serve it on a unix socket")
     mode.add_argument("--connect", type=Path, metavar="SOCKET", help="MCP front end for a --serve process")
     parser.add_argument("--http", metavar="HOST:PORT", help="with --connect: serve MCP over HTTP")
-    parser.add_argument("--http-token", default="mcp", help="secret URL path segment for --http")
+    parser.add_argument(
+        "--http-token", help="secret URL path segment for --http (default: a random one, printed)"
+    )
     parser.add_argument(
         "--project", type=Path, help="a project folder with chronobox.toml (sets image, setup, size)"
     )
@@ -463,12 +489,15 @@ def main(argv: list[str] | None = None) -> None:
         socket_path = up_socket(project)
         if asyncio.run(is_serving(socket_path)):
             args.connect = socket_path
-    if args.connect:
-        asyncio.run(run_connected(args))
-    elif args.serve:
-        asyncio.run(run_serving(args))
-    else:
-        asyncio.run(run_local(args))
+    try:
+        if args.connect:
+            asyncio.run(run_connected(args))
+        elif args.serve:
+            asyncio.run(run_serving(args))
+        else:
+            asyncio.run(run_local(args))
+    except VMError as error:
+        sys.exit(f"chronobox-mcp: {error}")
 
 
 if __name__ == "__main__":
