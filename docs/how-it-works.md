@@ -41,8 +41,8 @@ src/chronobox/   vm.py (Firecracker backend) · workspace.py (main, checkpoints,
                  images.py · install.py (`chronobox setup`, `doctor`) · cli.py (`chronobox build`,
                  `images`, `init`, `guide`, `warm`, `clean`, `up`, `cp`, `down`, `mcp`)
                  config.py (chronobox.toml) · project.py (bring a project up, warm start, diff,
-                 export, sync) · handoff.py (`verify_script`) · guide.py (AGENTS.md)
-                 · copying.py (`chronobox cp`)
+                 export, sync) · handoff/ (`verify_script`: scripts, running, replay, report,
+                 files, review, tools) · guide.py (AGENTS.md) · copying.py (`chronobox cp`)
 vm/              tools/ (tools drive: init, guest agent) · images/default/ (the default image)
 tests/           unit tests + real-VM tests (skipped without /dev/kvm)
 examples/notes/  a web app + PostgreSQL project with its chronobox.toml

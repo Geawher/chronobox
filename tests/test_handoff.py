@@ -25,8 +25,6 @@ from chronobox.handoff import (
     Replay,
     Scripts,
     Step,
-    _file_names,
-    _slow_hint,
     bash_features,
     difference,
     handoff_tools,
@@ -35,6 +33,8 @@ from chronobox.handoff import (
     save_handoff,
     withdraw_handoff,
 )
+from chronobox.handoff.files import file_names
+from chronobox.handoff.tools import _slow_hint
 from chronobox.project import ProjectBoot, machine_spec
 from chronobox.service import Method
 from chronobox.vm import FirecrackerBackend, MachineSpec
@@ -140,7 +140,7 @@ def test_file_names_are_relative_to_the_project_whatever_the_archive_prefix() ->
             member = tarfile.TarInfo(name)
             member.type = tarfile.DIRTYPE if name == "./lib" else tarfile.REGTYPE
             tar.addfile(member, io.BytesIO(b""))
-    assert _file_names(buffer.getvalue()) == {"lib/a.py", "b.py"}
+    assert file_names(buffer.getvalue()) == {"lib/a.py", "b.py"}
 
 
 def test_a_new_handoff_replaces_the_previous_one(tmp_path: Path) -> None:
@@ -422,7 +422,7 @@ async def test_a_second_run_that_redoes_the_whole_job_fails(
 ) -> None:
     """Run again once it ended, a script must be quick (here: within half its first run, at least
     2 s): one that redoes everything is stopped and told to skip finished work."""
-    monkeypatch.setattr(handoff, "SECOND_RUN_MIN_S", 2.0)
+    monkeypatch.setattr(handoff.replay, "SECOND_RUN_MIN_S", 2.0)
     _, tools = bare
     reply = await tools["verify_script"]("sleep 6", check="true")
     assert "was still going after 3 s" in reply and "skip what is already done" in reply, reply
@@ -491,7 +491,7 @@ async def test_a_long_replay_goes_on_in_the_background_after_the_foreground_wait
 ) -> None:
     """verify_script stops waiting after ``FOREGROUND_WAIT_S`` (1 s here) and says how to collect the
     replay, which goes on and is then given by ``verify_result``."""
-    monkeypatch.setattr(handoff, "FOREGROUND_WAIT_S", 1.0)
+    monkeypatch.setattr(handoff.tools, "FOREGROUND_WAIT_S", 1.0)
     _, tools = bare
     reply = await tools["verify_script"]("sleep 4", check="true", twice=False)
     assert "still replaying after 1 s" in reply and "verify_result(fork='replay-1'" in reply, reply
