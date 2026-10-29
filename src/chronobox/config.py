@@ -74,7 +74,7 @@ SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # What `chronobox init` writes: every option, commented, around the values it could guess.
 STARTER_TEMPLATE = """\
-# How to bring this project up in a chronobox machine (docs: README, "Your project").
+# How to bring this project up in a chronobox machine (docs: docs/projects.md).
 # Machines have no network: everything the project needs must be installed in the image.
 
 image = {image}
