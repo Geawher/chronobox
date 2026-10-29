@@ -35,6 +35,7 @@
   the server starts from. ([#15])
 - `--http-token` is random by default (it was `mcp`). ([#15])
 - `chronobox init` adds `.chronobox/` to `.gitignore`. ([#15])
+- The README keeps the highlights; the details are in [docs/](docs/README.md). ([#16])
 
 ### Removed
 - `vm/fetch.sh` and `vm/build_rootfs.sh`: use `chronobox setup`. ([#15])
@@ -62,3 +63,4 @@ lessons and an optional rehearsal guard. ([#1], [#2], [#3])
 [#12]: https://github.com/Geawher/chronobox/pull/12
 [#13]: https://github.com/Geawher/chronobox/pull/13
 [#15]: https://github.com/Geawher/chronobox/pull/15
+[#16]: https://github.com/Geawher/chronobox/pull/16
